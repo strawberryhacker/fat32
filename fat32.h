@@ -1,11 +1,12 @@
-//----------------------------------------------------------------------------//
-
-// Copyright (c) 2020 Bjørn Brodtkorb
+//------------------------------------------------------------------------------
+// Copyright (c) 2020 BjÃ¸rn Brodtkorb
 //
 // This software is provided without warranty of any kind.
 // Permission is granted, free of charge, to copy and modify this
 // software, if this copyright notice is included in all copies of
 // the software.
+//------------------------------------------------------------------------------
+
 
 #ifndef FAT32_H
 #define FAT32_H
@@ -70,6 +71,15 @@ struct dirinfo_s {
 	
 	u32 size;
 };
+
+//------------------------------------------------------------------------------
+// Microsoft FAT32 spesification
+// Due to Microsoft releasing the licensing on FAT LFN usage, this code will 
+// use LFN instead of SFN. It will not have SFN support since it is not meant
+// for smaller systems.
+//------------------------------------------------------------------------------
+#define SOMETHING
+
 
 // Disk functions
 u8 disk_mount(disk_e disk);
