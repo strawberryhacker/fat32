@@ -14,8 +14,10 @@
 #include "disk_interface.h"
 
 typedef enum {
-	FATRES_OK,
-	FATRES_ERROR
+	FSTATUS_OK,
+	FSTATUS_ERROR,
+	FSTATUS_NO_VOLUME,
+	FSTATUS_PATH_ERR
 } fstatus;
 
 struct volume_s {
@@ -24,7 +26,7 @@ struct volume_s {
 	
 	// The first label is 11-bytes and located in the BPB
 	// The sectondary label is introduced in the root directory
-	char label[256];
+	char label[11];
 	char letter;
 	
 	// FAT32 info
@@ -35,21 +37,27 @@ struct volume_s {
 	// FAT32 offsets
 	u32 fat_lba;
 	u32 info_lba;
+	u32 data_lba;
 	u32 root_lba;
 	
 	// Working buffers
 	u8 buffer[512];
 	u32 buffer_lba;
+	disk_e disk;
 	u8 buffer_dirty;
 	
 	char lfn[256];
 	u8 lfn_size;
+	
 };
 
 struct dir_s {
 	u32 sector;
 	u32 cluster;
 	u32 rw_offset;
+	
+	u32 start_sect;
+	struct volume_s* vol;
 };
 
 struct file_s {
@@ -86,6 +94,8 @@ struct partition_s {
 // use LFN instead of SFN. It will not have SFN support since it is not meant
 // for smaller systems.
 //------------------------------------------------------------------------------
+
+// MBR and boot sector
 #define MBR_BOOTSTRAP		0
 #define MBR_BOOTSTRAP_SIZE	446
 #define MBR_PARTITION		446
@@ -137,6 +147,37 @@ struct partition_s {
 #define BPB_32_VOL_LABEL	71
 #define BPB_32_FSTYPE		82
 
+// Directory entry defines
+#define SFN_NAME		0
+#define SFN_ATTR		11
+#define SFN_NTR			12
+#define SFN_CTIME_TH	13
+#define SFN_CTIME		14
+#define SFN_CDATE		16
+#define SFN_LDATE		18
+#define SFN_CLUSTH		20
+#define SFN_WTIME		22
+#define SFN_WDATE		24
+#define SFN_CLUSTL		26
+#define SFN_FILE_SIZE	28
+
+#define LFN_SEQ		0
+#define LFN_SEQ_MSK	0x1F
+#define LFN_NAME_1	1
+#define LFN_ATTR	11
+#define LFN_TYPE	12
+#define LFN_CRC		13
+#define LFN_NAME_2	14
+#define LFN_NAME_3	28
+
+#define ATTR_RO			0x01
+#define ATTR_HIDD		0x02
+#define ATTR_SYS		0x04
+#define ATTR_VOL_LABEL		0x08
+#define ATTR_DIR		0x10
+#define ATTR_ARCH		0x20
+#define ATTR_LFN		0x0F
+
 
 // File system thread
 void fat32_thread(void* arg);
@@ -152,12 +193,13 @@ fstatus volume_set_label(struct volume_s* vol, const char* name, u8 length);
 fstatus volume_get_label(struct volume_s* vol, char* name, u8 length);
 fstatus volume_format(struct volume_s* vol);
 
-// FAT32 functions
+// FAT32 directory actions
 fstatus fat_dir_open(struct dir_s* dir, const char* path, u16 length);
 fstatus fat_dir_close(struct dir_s* dir);
 fstatus fat_dir_read(struct dir_s* dir, struct info_s* info);
 fstatus fat_dir_make(const char* path);
 
+// FAT32 file actions
 fstatus fat_file_open(struct file_s* file, const char* path, u16 length);
 fstatus fat_file_close(struct file_s* file);
 fstatus fat_file_read(struct file_s* file, u8* buffer, u32 count, u32* status);
