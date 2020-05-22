@@ -11,6 +11,7 @@
 #include "board_serial.h"
 #include "board_sd_card.h"
 #include "dynamic_memory.h"
+#include "syscall.h"
 
 #include <stddef.h>
 
@@ -27,7 +28,8 @@ static u32 volume_bitmask;
 static u8 mount_buffer[512];
 
 // LFN UCS-2 offsets
-static const u8 lfn_off[] =  {1, 3, 5, 7, 9, 14, 16, 18, 20, 22, 24, 28, 30};
+static const u8 lfn_offsets[] = {1, 3, 5, 7, 9, 14, 16, 18, 20, 22, 24, 28, 30};
+static const char file_size_ext[] = {'k', 'M', 'G'};
 
 
 // Private function declarations
@@ -50,7 +52,7 @@ static u8 fat_dir_sfn_cmp(const char* sfn, const char* name, u8 size);
 static u8 fat_dir_sfn_crc(const u8* sfn);
 static u8 fat_dir_set_index(struct dir_s* dir, u32 index);
 static u8 fat_dir_get_next(struct dir_s* dir);
-static u8 fat_dir_find(struct dir_s* dir, const char* name, u32 size);
+static u8 fat_dir_search(struct dir_s* dir, const char* name, u32 size);
 
 static u8 fat_table_get(struct volume_s* vol, u32 cluster, u32* fat);
 static u8 fat_table_set(struct volume_s* vol, u32 cluster, u32 fat_entry);
@@ -63,6 +65,11 @@ static inline u32 fat_clust_to_sect(struct volume_s* vol, u32 clust);
 
 static fstatus fat_follow_path(struct dir_s* dir, const char* path, u32 length);
 static fstatus fat_get_vol_label(struct volume_s* vol, char* label);
+
+// Remove this
+static void fat_print_info(struct info_s* info);
+
+static u8 fat_file_addr_resolve(struct file_s* file);
 
 
 
@@ -299,6 +306,33 @@ static u8 fat_dir_get_next(struct dir_s* dir) {
 	return 1;
 }
 
+static u8 fat_file_addr_resolve(struct file_s* file) {	
+	// Check for rw position overflow
+	if (file->rw_offset >= file->vol->sector_size) {
+		file->rw_offset -= file->vol->sector_size;
+		file->sector++;
+		
+		// Check for sector overflow. In this case the next sector (and cluster)
+		// can be retrieved from the FAT table
+		if (file->sector >= (fat_clust_to_sect(file->vol, file->cluster) +
+		file->vol->cluster_size)) {
+			u32 new_cluster;
+			if (!fat_table_get(file->vol, file->cluster, &new_cluster)) {
+				return 0;
+			}
+			
+			// Check if the FAT table entry is the EOC
+			u32 eoc_value = new_cluster & 0xFFFFFFF;
+			if ((eoc_value >= 0xFFFFFF8) && (eoc_value <= 0xFFFFFFF)) {
+				return 0;
+			}
+			file->cluster = new_cluster;
+			file->sector = fat_clust_to_sect(file->vol, file->cluster);	 
+		}
+	}
+	return 1;
+}
+
 // Takes in a cluster and return the 4-byte FAT table entry corresponding to
 // this cluster. 
 static u8 fat_table_get(struct volume_s* vol, u32 cluster, u32* fat) {
@@ -359,7 +393,8 @@ static u8 fat_flush(struct volume_s* vol) {
 
 // Maps a sector LBA to the relative cluster number and vica verca
 static inline u32 fat_sect_to_clust(struct volume_s* vol, u32 sect) {
-	return (sect - vol->data_lba) / vol->cluster_size + 2;
+	u32 cluster = ((sect - vol->data_lba) / vol->cluster_size) + 2;
+	return cluster;
 }
 
 static inline u32 fat_clust_to_sect(struct volume_s* vol, u32 clust) {
@@ -393,11 +428,11 @@ static u8 fat_dir_lfn_cmp(const u8* lfn, const char* name, u32 size) {
 	u8 name_off = 13 * ((lfn[LFN_SEQ] & LFN_SEQ_MSK) - 1);
 	
 	for (u8 i = 0; i < 13; i++) {
-		if (lfn[lfn_off[i]] == 0x00 || lfn[lfn_off[i]] == 0xff) {
+		if (lfn[lfn_offsets[i]] == 0x00 || lfn[lfn_offsets[i]] == 0xff) {
 			break;
 		}
 
-		if (lfn[lfn_off[i]] != name[name_off + i]) {
+		if (lfn[lfn_offsets[i]] != name[name_off + i]) {
 			return 0;
 		}
 	}
@@ -405,7 +440,7 @@ static u8 fat_dir_lfn_cmp(const u8* lfn, const char* name, u32 size) {
 }
 
 // Takes in a pointer to a directory and tries to find a name match
-static u8 fat_dir_find(struct dir_s* dir, const char* name, u32 size) {
+static u8 fat_dir_search(struct dir_s* dir, const char* name, u32 size) {
 	
 	// If the directory object is not pointing to the directory start, fix it.
 	if (dir->start_sect != dir->sector) {
@@ -464,6 +499,7 @@ static u8 fat_dir_find(struct dir_s* dir, const char* name, u32 size) {
 						rw_tmp + SFN_CLUSTL);
 					dir->sector = fat_clust_to_sect(dir->vol, dir->cluster);
 					dir->start_sect = dir->sector;
+					dir->size = fat_load32(curr_buff + rw_tmp + SFN_FILE_SIZE);
 					dir->rw_offset = 0;
 
 					return 1;
@@ -524,7 +560,7 @@ static fstatus fat_follow_path(struct dir_s* dir, const char* path, u32 length) 
 		frag_size = 0;
 		
 		while ((*tmp_ptr != '\0') && (*tmp_ptr != '/')) {
-			
+						
 			// The current name fragment is a file, However, the name fragment
 			// before it has been found. The dir is pointing to that entry. 
 			if (*tmp_ptr == '.') {
@@ -544,7 +580,7 @@ static fstatus fat_follow_path(struct dir_s* dir, const char* path, u32 length) 
 		print("\n" ANSI_NORMAL);
 
 		// Start from the first entry and search for the name fragment
-		if (!fat_dir_find(dir, frag_ptr, frag_size)) {
+		if (!fat_dir_search(dir, frag_ptr, frag_size)) {
 			print(ANSI_RED "Directory not fount\n" ANSI_NORMAL);
 			return 0;
 		} else {
@@ -593,6 +629,39 @@ static fstatus fat_get_vol_label(struct volume_s* vol, char* label) {
 	}
 }
 
+// Remove
+static void fat_print_info(struct info_s* info) {
+	u32 size = info->size;
+	char ext = 0;	
+	u8 ext_cnt = 0;
+	while (size >= 1000) {
+		size /= 1000;
+		ext = file_size_ext[ext_cnt++];
+	}
+	print("%d", size);
+	if (ext) {
+		print("%c", ext);
+	}
+	print("B\t");
+	u16 time = info->w_time;
+	u16 date = info->w_date;
+	
+	print("%d/%d/%d %d:%d\t", 
+		date & 0b11111,
+		(date >> 5) & 0b1111,
+		((date >> 9) & 0b1111111) + 1980,
+		(time >> 11) & 0b11111,
+		(time >> 5) & 0b111111);
+		
+	if (info->attribute & ATTR_DIR) {
+		print("DIR\t");
+	} else {
+		print("\t");
+	}
+	
+	print_count(info->name, info->name_length);
+	print("\n");
+}
 
 //------------------------------------------------------------------------------
 // FAT23 file system API
@@ -611,6 +680,9 @@ void fat32_thread(void* arg) {
 	// functions may be ehh...
 	disk_mount(DISK_SD_CARD);
 	
+	struct volume_s* tmp = volume_get('D');
+	
+	// ----- Print volumes -----
 	// Print all the volumes on the system
 	print("Displaying system volumes:\n");
 	struct volume_s* vol = volume_get_first();
@@ -625,10 +697,47 @@ void fat32_thread(void* arg) {
 	}
 	print("\n");
 	
+
+
+	// ----- Print info -----
 	struct dir_s dir;
-	fat_follow_path(&dir, "C:/alpha/bravo/charlie", 0);
-	fat_follow_path(&dir, "D:/tommy/tyckar/om/meg/", 0);
+	fat_follow_path(&dir, "C:/alpha", 0);
 	
+	struct info_s* info = (struct info_s *)dynamic_memory_new(DRAM_BANK_0,
+		sizeof(struct info_s));
+	fstatus status;
+	do {
+		status = fat_dir_read(&dir, info);
+
+		// Print the information
+		if (status == FSTATUS_OK) {
+			fat_print_info(info);
+		}
+	} while (status != FSTATUS_EOF);
+	print(ANSI_RED "End of directory\n" ANSI_NORMAL);
+	
+	
+	// ----- Read test -----
+	// Allocate a file read buffer
+	struct file_s file;
+	fat_file_open(&file, "C:/alpha/textdocument.txt", 25);
+	
+	print(ANSI_RED "FIRST CLUSTER %d\n" ANSI_NORMAL, file.cluster);
+	u8* read_buffer = (u8 *)dynamic_memory_new(DRAM_BANK_1, 512);
+	u32 read_status;
+	do {
+		fat_file_read(&file, read_buffer, 512, &read_status);
+		print_count((char*)read_buffer, read_status);
+	} while (read_status == 512);
+	
+	fat_file_jump(&file, file.size - 8);
+	
+	print(BLUE);
+	do {
+		fat_file_read(&file, read_buffer, 512, &read_status);
+		print_count((char*)read_buffer, read_status);
+	} while (read_status == 512);
+	print(ANSI_NORMAL);
 	while (1) {
 		
 	}
@@ -746,15 +855,268 @@ struct volume_s* volume_get(char letter) {
 	return NULL;
 }
 
-fstatus volume_set_label(struct volume_s* vol, const char* name, u8 length);
-fstatus volume_get_label(struct volume_s* vol, char* name, u8 length);
-fstatus volume_format(struct volume_s* vol);
-fstatus fat_dir_open(struct dir_s* dir, const char* path, u16 length);
-fstatus fat_dir_close(struct dir_s* dir);
-fstatus fat_dir_read(struct dir_s* dir, struct info_s* info);
-fstatus fat_dir_make(const char* path);
-fstatus fat_file_open(struct file_s* file, const char* path, u16 length);
-fstatus fat_file_close(struct file_s* file);
-fstatus fat_file_read(struct file_s* file, u8* buffer, u32 count, u32* status);
-fstatus fat_file_write(struct file_s* file, const u8* buffer, u32 count);
-fstatus fat_file_jump(struct file_s* file, u32 offset);
+fstatus volume_set_label(struct volume_s* vol, const char* name, u8 length) {
+	// Make a dir object pointing to the root directory
+	struct dir_s dir;
+	dir.sector = vol->root_lba;
+	dir.rw_offset = 0;
+	dir.cluster = fat_sect_to_clust(vol, dir.sector);
+	
+	while (1) {
+		if (!fat_read(vol, dir.sector)) {
+			return FSTATUS_ERROR;
+		}
+		
+		// Check if the attribute is volume label
+		u8 attribute = vol->buffer[dir.rw_offset + SFN_ATTR];
+		if (attribute & ATTR_VOL_LABEL) {
+			
+			// Check that it is not a LFN entry
+			if ((attribute & ATTR_LFN) != ATTR_LFN) {
+				char* src = (char *)(vol->buffer + dir.rw_offset);
+				for (u8 i = 0; i < 11; i++) {
+					// The volume label is padded with spaces
+					if (i >= length) {
+						*src++ = ' ';
+					} else {
+						*src++ = *name++;
+					}
+					vol->buffer_dirty = 1;
+				}
+				// Writes the buffer back to the MSD
+				fat_flush(vol);
+				return 1;
+			}
+		}
+		
+		// Get the next directory
+		if (!fat_dir_get_next(&dir)) {
+			return 0;
+		}
+	}
+}
+
+// Get the volue label
+fstatus volume_get_label(struct volume_s* vol, char* name) {
+	return fat_get_vol_label(vol, name);
+}
+
+// Formats the volume
+fstatus volume_format(struct volume_s* vol) {
+	return FSTATUS_OK;
+}
+
+// Opens a directory
+fstatus fat_dir_open(struct dir_s* dir, const char* path, u16 length) {
+	return fat_follow_path(dir, path, length);
+}
+
+fstatus fat_dir_close(struct dir_s* dir) {
+	// Check if the volume is clean
+	if (!fat_flush(dir->vol)) {
+		return FSTATUS_ERROR;
+	}
+	return FSTATUS_OK;
+}
+
+fstatus fat_dir_read(struct dir_s* dir, struct info_s* info) {
+	u8 lfn_crc = 0;
+	u8 name_length = 0;
+	while (1) {
+		if (!fat_read(dir->vol, dir->sector)) {
+			return FSTATUS_ERROR;
+		}
+		u8* entry_ptr = dir->vol->buffer + dir->rw_offset;
+		
+		// Check if the entry is in use
+		u8 sfn_check = entry_ptr[0];
+		
+		// Check for the end marker
+		if (sfn_check == 0x00) {
+			return FSTATUS_EOF;
+		}
+		if ((sfn_check != 0xE5) && (sfn_check != 0x05)) {
+			u8 sfn_attr = entry_ptr[SFN_ATTR];
+			
+			// We have a used directory, so read the attribute field to check
+			// if it belongs to a SFN or a LFN
+			if ((sfn_attr & ATTR_LFN) == ATTR_LFN) {
+				
+				// LFN case
+				u8 name_offset = 13 * ((entry_ptr[0] & LFN_SEQ_MSK) - 1);
+				for (u8 i = 0; i < 13; i++) {
+					u8 tmp_char = entry_ptr[lfn_offsets[i]]; 
+					if (!((tmp_char == 0x00) || (tmp_char == 0xFF))) {
+						info->name[name_offset + i] = tmp_char;
+						name_length++;
+					}
+				}
+				lfn_crc = entry_ptr[LFN_CRC];
+			} else {
+				if (lfn_crc) {
+					// This SFN entry is the last entry in a chain of
+					// LFN entries. Return CRC error if the checksum is wrong
+					if (lfn_crc != fat_dir_sfn_crc(entry_ptr)) {
+						return FSTATUS_ERROR;
+					}
+					
+				} else {
+					// Just one SFN entry needs to be read
+					for (u8 i = 0; i < 11; i++) {
+						info->name[i] = entry_ptr[i];
+						name_length++;
+					}
+				}
+				
+				// The code should return
+				// Here we update the SFN field that is not the name
+				info->attribute = entry_ptr[SFN_ATTR];
+				info->c_time_tenth = entry_ptr[SFN_CTIME_TH];
+				info->c_time = fat_load16(entry_ptr + SFN_CTIME);
+				info->c_date = fat_load16(entry_ptr + SFN_CDATE);
+				info->w_time = fat_load16(entry_ptr + SFN_WTIME);
+				info->w_date = fat_load16(entry_ptr + SFN_WDATE);
+				info->a_date = fat_load16(entry_ptr + SFN_ADATE);
+				info->size = fat_load32(entry_ptr + SFN_FILE_SIZE);
+				info->name_length = name_length;
+				
+				// Get the next entry
+				fat_dir_get_next(dir);
+				
+				return FSTATUS_OK;
+			}
+			}
+		// Get the next entry
+		fat_dir_get_next(dir);
+	}
+}
+
+// Makes a directory in the specified path
+fstatus fat_dir_make(const char* path) {
+	return FSTATUS_OK;
+}
+
+// Opens a file and returns the file object. It takes in a global path.
+fstatus fat_file_open(struct file_s* file, const char* path, u16 length) {
+	struct dir_s dir;
+
+	fstatus status = fat_follow_path(&dir, path, length);
+	if (status != FSTATUS_OK) {
+		return status;
+	}
+	const char* char_ptr = path + length - 1;
+	if (*char_ptr == 0x00) return FSTATUS_PATH_ERR;
+	if (*char_ptr == '/') {
+		char_ptr--;
+	}
+	u8 frag_size;
+	
+	while ((*char_ptr != '/') && (*char_ptr != 0x00)) {
+		frag_size++;
+		char_ptr--;
+	}
+	if (*char_ptr == 0x00) {
+		return FSTATUS_PATH_ERR;
+	}
+	
+	// Try to find the file
+	if (!fat_dir_search(&dir, char_ptr + 1, frag_size)) {
+		return FSTATUS_PATH_ERR;
+	}
+	
+	// Update whe address of the file
+	file->sector = dir.sector;
+	file->start_sect = dir.sector;
+	file->cluster = dir.cluster;
+	file->rw_offset = 0;
+	file->vol = dir.vol;
+	file->size = dir.size;
+	
+	print(ANSI_RED "File size: %d\n" ANSI_NORMAL, file->size);
+	
+	return FSTATUS_OK;
+}
+
+// Cleans up a file
+fstatus fat_file_close(struct file_s* file) {
+	if(!fat_flush(file->vol)) {
+		return FSTATUS_ERROR;
+	}
+	return FSTATUS_OK;
+}
+
+// This functions reads a number of bytes from the file pointer. It will return 
+// the number of bytes written. If the requested number and returned number 
+// differ, the EOF marked has been hit. 
+fstatus fat_file_read(struct file_s* file, u8* buffer, u32 count, u32* status) {
+	*status = 0;
+	u16 sector_size = file->vol->sector_size;
+	u32 file_size = file->size;
+	
+	if (!fat_read(file->vol, file->sector)) {
+		return FSTATUS_ERROR;
+	}
+	while (count--) {
+		
+		// If the rw offset is too big, call the functions that resolves the
+		// address. This means update the sector and the cluster
+		if (file->rw_offset >= sector_size) {
+			fat_file_addr_resolve(file);
+			
+			// Update the file system buffer
+			if (!fat_read(file->vol, file->sector)) {
+				return FSTATUS_ERROR;
+			}
+		}
+		*buffer++ = file->vol->buffer[file->rw_offset++];
+		// Updat the offsets
+		file->glob_offset++;
+		(*status)++;
+		
+		if (file->glob_offset >= file_size) {
+			break;
+		}
+	}
+	return FSTATUS_OK;
+}
+
+// Write a number of characters to the location pointed to be file
+fstatus fat_file_write(struct file_s* file, const u8* buffer, u32 count) {
+	return FSTATUS_OK;
+}
+
+// Move the read/write file pointer. The offset specified is from the start
+// of the file. 
+fstatus fat_file_jump(struct file_s* file, u32 offset) {
+	
+	// Make the file pointer point to the beginning of the file
+	file->cluster = fat_sect_to_clust(file->vol, file->start_sect);
+	
+	// Get the relative offsets
+	u32 sector_offset = offset / file->vol->sector_size;
+	u32 cluster_offset = sector_offset / file->vol->cluster_size;
+	sector_offset = sector_offset % file->vol->cluster_size;
+	
+	while (cluster_offset) {
+		u32 new_cluster;
+		if (!fat_table_get(file->vol, file->cluster, &new_cluster)) {
+			return FSTATUS_ERROR;
+		}
+		// Check if the FAT table entry is the EOC
+		u32 eoc_value = new_cluster & 0xFFFFFFF;
+		if ((eoc_value >= 0xFFFFFF8) && (eoc_value <= 0xFFFFFFF)) {
+			return 0;
+		}
+		 
+		file->cluster = new_cluster;		
+		cluster_offset--;
+	}
+	
+	// The base cluster address is determined. Update the sector and rw offset
+	// from the relative offsets calulated above. 
+	file->sector = fat_clust_to_sect(file->vol, file->cluster) + sector_offset;
+	file->rw_offset = offset % file->vol->sector_size;
+	file->glob_offset = offset;
+	
+	return FSTATUS_OK;
+}

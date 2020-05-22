@@ -17,7 +17,8 @@ typedef enum {
 	FSTATUS_OK,
 	FSTATUS_ERROR,
 	FSTATUS_NO_VOLUME,
-	FSTATUS_PATH_ERR
+	FSTATUS_PATH_ERR,
+	FSTATUS_EOF
 } fstatus;
 
 struct volume_s {
@@ -57,6 +58,7 @@ struct dir_s {
 	u32 rw_offset;
 	
 	u32 start_sect;
+	u32 size;
 	struct volume_s* vol;
 };
 
@@ -64,19 +66,24 @@ struct file_s {
 	u32 sector;
 	u32 cluster;
 	u32 rw_offset;
+	u32 size;
+	u32 start_sect;
+	u32 glob_offset;
+	struct volume_s* vol;
 };
 
 struct info_s {
 	// Long file name support
 	char name[256];
+	u8 name_length;
 	
 	u8	attribute;
 	u8	c_time_tenth;
 	u16 c_time;
-	u16 cdate;
-	u16 adate;
-	u16 wtime;
-	u16 wdate;
+	u16 c_date;
+	u16 a_date;
+	u16 w_time;
+	u16 w_date;
 	
 	u32 size;
 };
@@ -154,7 +161,7 @@ struct partition_s {
 #define SFN_CTIME_TH	13
 #define SFN_CTIME		14
 #define SFN_CDATE		16
-#define SFN_LDATE		18
+#define SFN_ADATE		18
 #define SFN_CLUSTH		20
 #define SFN_WTIME		22
 #define SFN_WDATE		24
@@ -190,7 +197,7 @@ u8 disk_eject(disk_e disk);
 struct volume_s* volume_get_first(void);
 struct volume_s* volume_get(char letter);
 fstatus volume_set_label(struct volume_s* vol, const char* name, u8 length);
-fstatus volume_get_label(struct volume_s* vol, char* name, u8 length);
+fstatus volume_get_label(struct volume_s* vol, char* name);
 fstatus volume_format(struct volume_s* vol);
 
 // FAT32 directory actions
