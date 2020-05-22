@@ -13,6 +13,7 @@
 #include "fat_types.h"
 #include "disk_interface.h"
 
+// Most of the FAT32 file system functions returns one of these status codes
 typedef enum {
 	FSTATUS_OK,
 	FSTATUS_ERROR,
@@ -20,6 +21,7 @@ typedef enum {
 	FSTATUS_PATH_ERR,
 	FSTATUS_EOF
 } fstatus;
+
 
 struct volume_s {
 	// Volume info
@@ -41,7 +43,8 @@ struct volume_s {
 	u32 data_lba;
 	u32 root_lba;
 	
-	// Working buffers
+	// All file system operations require a 512-byte buffer for storing the
+	// current sector.
 	u8 buffer[512];
 	u32 buffer_lba;
 	disk_e disk;
@@ -51,6 +54,7 @@ struct volume_s {
 	u8 lfn_size;
 	
 };
+
 
 struct dir_s {
 	u32 sector;
@@ -62,6 +66,7 @@ struct dir_s {
 	struct volume_s* vol;
 };
 
+
 struct file_s {
 	u32 sector;
 	u32 cluster;
@@ -72,12 +77,27 @@ struct file_s {
 	struct volume_s* vol;
 };
 
+// This structure will contain all information needed for a file or a folder. 
+// It is mainly used to read directory entries from a path
 struct info_s {
-	// Long file name support
+	
+	// By default this code supports long file name entries (LFN) up to 
+	// 256 characters. The same buffer will be used for LFN and SFN entries.
 	char name[256];
 	u8 name_length;
 	
+	// The attribute field apply to a file or a folder
+	// 
+	// Bit 0 - Read-only
+	// Bit 1 - Hidden
+	// Bit 2 - System (do not mess with these directories)
+	// Bit 3 - Volume label
+	// Bit 4 - Subdirectory
+	// Bit 5 - Archeive
+	// Bit 6 - Device
 	u8	attribute;
+	
+	// Time and date properties
 	u8	c_time_tenth;
 	u16 c_time;
 	u16 c_date;
@@ -85,15 +105,20 @@ struct info_s {
 	u16 w_time;
 	u16 w_date;
 	
+	// Contains the total size of a file or a folder
+	// A folder has 
 	u32 size;
 };
 
+// The classical generic MBR located at sector zero at a MSD contains four 
+// partition fields. This structure describe one partition. 
 struct partition_s {
 	u32 lba;
 	u32 size;
 	u8 status;
 	u8 type;
 };
+
 
 //------------------------------------------------------------------------------
 // Microsoft FAT32 spesification
@@ -180,10 +205,14 @@ struct partition_s {
 #define ATTR_RO			0x01
 #define ATTR_HIDD		0x02
 #define ATTR_SYS		0x04
-#define ATTR_VOL_LABEL		0x08
+#define ATTR_VOL_LABEL	0x08
 #define ATTR_DIR		0x10
 #define ATTR_ARCH		0x20
 #define ATTR_LFN		0x0F
+
+// FSinfo structure
+#define INFO_CLUST_CNT			488
+#define INFO_CLUST_NEXT_FREE	492
 
 
 // File system thread
@@ -205,6 +234,7 @@ fstatus fat_dir_open(struct dir_s* dir, const char* path, u16 length);
 fstatus fat_dir_close(struct dir_s* dir);
 fstatus fat_dir_read(struct dir_s* dir, struct info_s* info);
 fstatus fat_dir_make(const char* path);
+fstatus fat_dir_rename(struct dir_s* dir, const char* name, u8 length);
 
 // FAT32 file actions
 fstatus fat_file_open(struct file_s* file, const char* path, u16 length);
