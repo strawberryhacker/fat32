@@ -36,10 +36,8 @@ struct volume_s {
 	u16 sector_size;
 	u8 cluster_size;
 	u32 total_size;
-	
-	// FAT32 offsets
 	u32 fat_lba;
-	u32 info_lba;
+	u32 fsinfo_lba;
 	u32 data_lba;
 	u32 root_lba;
 	
@@ -48,7 +46,7 @@ struct volume_s {
 	u8 buffer[512];
 	u32 buffer_lba;
 	disk_e disk;
-	u8 buffer_dirty;
+	u32 buffer_dirty;
 	
 	char lfn[256];
 	u8 lfn_size;

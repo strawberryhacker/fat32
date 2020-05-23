@@ -20,7 +20,7 @@
 /// Buffer and bitmask used for volume mounting. When a partition on the MSD 
 /// contains a valid FAT32 file system, a FAT32 volume is dynamically allocated
 /// and added to the linked list with base `volume_base`. The bitmask ensures 
-/// a unique volume letter for each volume. 
+/// a unique volume letter for each volume 
 static struct volume_s* volume_base;
 static u32 volume_bitmask;
 
@@ -29,7 +29,7 @@ static u32 volume_bitmask;
 static u8 mount_buffer[512];
 
 /// UCS-2 offsets used in long file name (LFN) entries
-static const u8 lfn_offsets[] = {1, 3, 5, 7, 9, 14, 16, 18, 20, 22, 24, 28, 30};
+static const u8 lfn_lut[] = {1, 3, 5, 7, 9, 14, 16, 18, 20, 22, 24, 28, 30};
 	
 /// Remove
 static const char file_size_ext[] = {'k', 'M', 'G'};
@@ -38,7 +38,7 @@ static const char file_size_ext[] = {'k', 'M', 'G'};
 /// the FAT12/16/32 type is dependent on the number of cluster, and the sectors
 /// are dependent on the volume size.
 ///
-/// This look-up table does only apply when:
+/// This look-up table does ONLY apply when:
 ///		- sector size equals 512
 ///		- the reserved sector count equals 32
 ///		- number of FAT's equals 2
@@ -53,6 +53,7 @@ static const struct clust_size_s cluster_size_lut[] = {
 };
 
 
+// Private prototypes
 static void fat_memcpy(const void* src, void* dest, u32 count);
 static u8 fat_memcmp(const void* src_1, const void* src_2, u32 count);
 static void fat_store32(void* dest, u32 value);
@@ -81,6 +82,7 @@ static void fat_print_info(struct info_s* info);
 static u8 fat_file_addr_resolve(struct file_s* file);
 static fstatus fat_make_entry_chain(struct dir_s* dir, u8 entry_cnt);
 
+
 //Remove
 static void fat_print_table(struct volume_s* vol, u32 sector) {
 	fat_read(vol, vol->fat_lba + sector);
@@ -103,7 +105,7 @@ static void fat_print_table(struct volume_s* vol, u32 sector) {
 	print("\n" BLUE);
 }
 
-/// Copies `count` number of bytes using byte access
+/// Copies `count` number of bytes from source to destination using byte access
 static void fat_memcpy(const void* src, void* dest, u32 count) {
 	const u8* src_ptr = (const u8 *)src;
 	u8* dest_ptr = (u8 *)dest;
@@ -207,7 +209,6 @@ static u8 fat_volume_add(struct volume_s* vol) {
 	return 1;
 }
 
-
 /// Remove a volume from the system volumes. This functions does NOT delete the 
 /// memory
 static u8 fat_volume_remove(char letter) {
@@ -240,8 +241,8 @@ static u8 fat_volume_remove(char letter) {
 	return 1;
 }
 
-/// Checks for a valid FAT32 file system on the given partition. The `bpb`should
-/// point to a buffer containing the first sector in this parition. 
+/// Checks for a valid FAT32 file system on the given partition. The `bpb`
+/// should point to a buffer containing the first sector in this parition. 
 static u8 fat_search(const u8* bpb) {
 	// Check the BPB boot signature
 	if (fat_load16(bpb + 510) != 0xAA55) return 0;
@@ -297,7 +298,7 @@ static u8 fat_dir_set_index(struct dir_s* dir, u32 index) {
 	return 1;
 }
 
-/// Move the directory pointer to the next entry
+/// Move the `dir` pointer to the next 32-byte directory entry
 static u8 fat_dir_get_next(struct dir_s* dir) {
 	// Update the rw offset to point to the next 32-byte entry
 	dir->rw_offset += 32;
@@ -368,6 +369,7 @@ static u8 fat_file_addr_resolve(struct file_s* file) {
 
 /// Returns the 32-bit FAT entry corresponding with the cluster number
 static u8 fat_table_get(struct volume_s* vol, u32 cluster, u32* fat_entry) {
+	// Calculate the sector LBA from the FAT table base address
 	u32 start_sect = vol->fat_lba + cluster / 128;
 	u32 start_off = cluster % 128;
 	
@@ -378,9 +380,9 @@ static u8 fat_table_get(struct volume_s* vol, u32 cluster, u32* fat_entry) {
 	return 1;
 }
 
-// Takes in a cluster and a FAT table entry and updates the cluster FAT table
-// entry with this value.
+/// Set the FAT table entry corresponding to `cluster` to a specified value
 static u8 fat_table_set(struct volume_s* vol, u32 cluster, u32 fat_entry) {
+	// Calculate the sector LBA from the FAT table base address
 	u32 start_sect = vol->fat_lba + cluster / 128;
 	u32 start_offset = cluster % 128;
 	
@@ -388,21 +390,32 @@ static u8 fat_table_set(struct volume_s* vol, u32 cluster, u32 fat_entry) {
 		return 0;
 	}
 	fat_store32(vol->buffer + 4 * start_offset, fat_entry);
+	
+	// Mark the buffer as dirty
 	vol->buffer_dirty = 1;
+	
+	// Remove?
 	fat_flush(vol);
 	return 1;
 }
 
+/// Get the next free cluster from the FAT table and update the FSinfo to
+/// point to the next free cluster
 static u8 fat_get_cluster(struct volume_s* vol, u32* cluster) {
-	if (!fat_read(vol, vol->info_lba)) {
+	// Load the FSinfo sector
+	if (!fat_read(vol, vol->fsinfo_lba)) {
 		return 0;
 	}
 	u32 next_free = fat_load32(vol->buffer + INFO_CLUST_NEXT_FREE);
 	u32 tot_free = fat_load32(vol->buffer + INFO_CLUST_CNT);
 	
+	// The `next_free` pointer does necessary point to a free cluster. However
+	// it specifies where to start looking for a free block. The `sector` and 
+	// `rw` combined point to this position
 	u32 sector = vol->fat_lba + (next_free / 128);
 	u32 rw = (next_free % 128) * 4;
-	u32 entry;
+	
+	u32 entry = 0;
 	u8 match_found = 0;
 	while (1) {
 		// Load the current sector
@@ -422,48 +435,49 @@ static u8 fat_get_cluster(struct volume_s* vol, u32* cluster) {
 				vol->buffer_dirty = 1;
 			}
 		}
-		// Resolve the address
+		// Make `rw` and `sector` point to the next 4-byte table entry
 		rw += 4;
 		if (rw >= vol->sector_size) {
 			sector++;
 			rw = 0;
 		}
 	}
-	// Now the sector argument is containing the first free cluster and
-	// the entry is containing the next free clusters
-	if (!fat_read(vol, vol->info_lba)) {
+	// `cluster` points to the first free cluster which can now be used, while
+	// `sector` holdes the next free cluster value which should be written back
+	// to the FSinfo sector
+	if (!fat_read(vol, vol->fsinfo_lba)) {
 		return 0;
 	}	
-	fat_store32(vol->buffer + INFO_CLUST_NEXT_FREE, 
-		(128 * (sector - vol->fat_lba)) + (rw / 4));
+	fat_store32(vol->buffer + INFO_CLUST_NEXT_FREE, (128 * (sector - 
+		vol->fat_lba)) + (rw / 4));
 	fat_store32(vol->buffer + INFO_CLUST_CNT, tot_free - 1);
-	
-	// Write back the buffer to the MSD
 	vol->buffer_dirty = 1;
+	
+	// Remove?
 	fat_flush(vol);
 }
 
-// Takes in a LBA and update the volumes local buffer if needed. After this 
-// function returns, the LBA sector is clean and valid
+/// Updates the volume buffer with the sector `lba`. If this buffer is already
+/// present, the function returns `1`. Any dirty buffer will be written back
+/// before the next sector is fetched. Return only `0` in case of hardware fault
 static u8 fat_read(struct volume_s* vol, u32 lba) {
 	
-	// Check if the current buffer contains any dirty data, and if this is the
-	// case, write it back to the MSD before reading
-	if (vol->buffer_lba == lba) {
-		// Not nessecary to update buffer
-		return 1;
+	// Check if the sector is already cached
+	if (vol->buffer_lba != lba) {
+		// Flush any dirty buffer back to the storage device
+		if (!fat_flush(vol)) {
+			return 0;
+		}
+		// Cache the next sector
+		if (!disk_read(vol->disk, vol->buffer, lba, 1)) {
+			return 0;
+		}
+		vol->buffer_lba = lba;
 	}
-	if (!fat_flush(vol)) {
-		return 0;
-	}
-	if (!disk_read(vol->disk, vol->buffer, lba, 1)) {
-		return 0;
-	}
-	vol->buffer_lba = lba;
 	return 1;
 }
 
-// Check if the buffer is dirty and cleans it
+/// Clean a volume buffer
 static u8 fat_flush(struct volume_s* vol) {
 	if (vol->buffer_dirty) {
 		if (!disk_write(vol->disk, vol->buffer, vol->buffer_lba, 1)) {
@@ -474,26 +488,28 @@ static u8 fat_flush(struct volume_s* vol) {
 	return 1;
 }
 
-// Maps a sector LBA to the relative cluster number and vica verca
+/// Convert a relative cluster number to the absolute LBA address
 static inline u32 fat_sect_to_clust(struct volume_s* vol, u32 sect) {
 	return ((sect - vol->data_lba) / vol->cluster_size) + 2;
 }
 
+/// Convert an absolute LBA address to the relative cluster number
 static inline u32 fat_clust_to_sect(struct volume_s* vol, u32 clust) {
 	return ((clust - 2) * vol->cluster_size) + vol->data_lba;
 }
 
-// Universal compare without caring for capitals vs non-capitals
+/// Compares `size` characters from two strings without case sensitivity
 static u8 fat_dir_sfn_cmp(const char* sfn, const char* name, u8 size) {
 	if (size > 8) {
 		size = 8;
 	}
 	do {
 		char tmp_char = *name;
+		
+		// A lowercase characters is converted to an uppercase
 		if (tmp_char >= 'a' && tmp_char <= 'z') {
 			tmp_char -= 32;
 		}
-		
 		if (tmp_char != *sfn) {
 			return 0;
 		}
@@ -503,28 +519,34 @@ static u8 fat_dir_sfn_cmp(const char* sfn, const char* name, u8 size) {
 	return 1;
 }
 
-// Takes in a pointer to a LFN entry and check if it matches the given name
+/// Compartes a LFN entry against a given file name. `name` is the full string 
+/// to be comared and `lfn` is only one LFN entry. The code will just compare
+/// the affected fragment of the `name` string.
 static u8 fat_dir_lfn_cmp(const u8* lfn, const char* name, u32 size) {
 	
-	// Calculate the name offset
+	// Compute the `name` offset of a fragment which should match the LFN name
 	u8 name_off = 13 * ((lfn[LFN_SEQ] & LFN_SEQ_MSK) - 1);
 	
 	for (u8 i = 0; i < 13; i++) {
-		if (lfn[lfn_offsets[i]] == 0x00 || lfn[lfn_offsets[i]] == 0xff) {
+		// The first empty UCS-2 character will contain 0x0000 and the rest will
+		// contain 0xFFFF. 
+		if (lfn[lfn_lut[i]] == 0x00 || lfn[lfn_lut[i]] == 0xff) {
 			break;
 		}
-
-		if (lfn[lfn_offsets[i]] != name[name_off + i]) {
+		// Compare the first charater in the UCS-2. This will typically be a
+		// ordinary ASCII character
+		if (lfn[lfn_lut[i]] != name[name_off + i]) {
 			return 0;
 		}
 	}
 	return 1;
 }
 
-// Takes in a pointer to a directory and tries to find a name match
+/// Takes in a pointer to a directory (does not need to be the leading entry)
+/// and tries to find a directory entry matching `name`
 static u8 fat_dir_search(struct dir_s* dir, const char* name, u32 size) {
 	
-	// If the directory object is not pointing to the directory start, fix it.
+	// A search start from the leading entry
 	if (dir->start_sect != dir->sector) {
 		dir->sector = dir->start_sect;
 		dir->cluster = fat_sect_to_clust(dir->vol, dir->sector);
@@ -532,56 +554,58 @@ static u8 fat_dir_search(struct dir_s* dir, const char* name, u32 size) {
 	}
 	
 	u8 lfn_crc = 0;
-	u8 lfn_match;
+	u8 lfn_match = 1;
 	u8 match = 0;
 	
 	while (1) {
 		// Update the buffer if needed
 		if (!fat_read(dir->vol, dir->sector)) {
-			
 			return 0;
 		}
-		u8* curr_buff = dir->vol->buffer;
+		u8* buffer = dir->vol->buffer;
+		u32 rw_offset = dir->rw_offset;
 		
-		// Check if the directory is valid
-		u32 rw_tmp = dir->rw_offset;
-		u8 sfn_tmp = curr_buff[rw_tmp];
-		
+		u8 sfn_tmp = buffer[rw_offset];
+		// Check for the EOD marker
 		if (sfn_tmp == 0x00) {
 			break;
 		}
-		
-		// Only allow to compare used folders
+		// Only allow used folders to be compared
 		if (!((sfn_tmp == 0x00) || (sfn_tmp == 0x05) || (sfn_tmp == 0xE5))) {
 			
-			// Check if the entry pointed to by dir is a LFN or a SFN
-			if ((curr_buff[rw_tmp + SFN_ATTR] & ATTR_LFN) == ATTR_LFN) {
+			// Check if the entry pointed to by `dir` is a LFN or a SFN
+			if ((buffer[rw_offset + SFN_ATTR] & ATTR_LFN) == ATTR_LFN) {
 				
 				// If the LFN name does not match the input
-				if (!fat_dir_lfn_cmp(curr_buff + rw_tmp, name, size)) {
+				if (!fat_dir_lfn_cmp(buffer + rw_offset, name, size)) {
+					// TODO:
+					// LFN contains the sequence number so we could jump to
+					// the next entry right away
 					lfn_match = 0;
 				}
-				lfn_crc = curr_buff[rw_tmp + LFN_CRC];
+				lfn_crc = buffer[rw_offset + LFN_CRC];
 			} else {
+				
+				// The current entry is a SFN
 				if (lfn_crc && lfn_match) {
-					// Update the directory
-					if (lfn_crc == fat_dir_sfn_crc(curr_buff + rw_tmp)) {
+					// The current SFN entry is the last in a sequence of LFN's
+					if (lfn_crc == fat_dir_sfn_crc(buffer + rw_offset)) {
 						match = 1;
 					}
 				} else {
-					// Compare name with 8.3 file name
-					if (fat_dir_sfn_cmp((char *)curr_buff + rw_tmp, name, size)) {
+					// Compare `name` with the SFN 8.3 file name
+					if (fat_dir_sfn_cmp((char *)buffer + rw_offset, name, size)) {
 						match = 1;
 					}
 				}
 				if (match) {
-					// The directory is found, so update the dir pointer
-					dir->cluster = (fat_load16(curr_buff + rw_tmp +
-						SFN_CLUSTH) << 16) | fat_load16(curr_buff +
-						rw_tmp + SFN_CLUSTL);
+					// Update the `dir` pointer
+					dir->cluster = (fat_load16(buffer + rw_offset +
+						SFN_CLUSTH) << 16) | fat_load16(buffer +
+						rw_offset + SFN_CLUSTL);
 					dir->sector = fat_clust_to_sect(dir->vol, dir->cluster);
 					dir->start_sect = dir->sector;
-					dir->size = fat_load32(curr_buff + rw_tmp + SFN_FILE_SIZE);
+					dir->size = fat_load32(buffer + rw_offset + SFN_FILE_SIZE);
 					dir->rw_offset = 0;
 
 					return 1;
@@ -590,6 +614,7 @@ static u8 fat_dir_search(struct dir_s* dir, const char* name, u32 size) {
 				lfn_crc = 0;
 			}
 		}
+		// Get the next 32-byte directory entry
 		if (!fat_dir_get_next(dir)) {
 			return 0;
 		}
@@ -597,54 +622,55 @@ static u8 fat_dir_search(struct dir_s* dir, const char* name, u32 size) {
 	return 0;
 }
 
-// This function will take in a path and a blank directory object
-// The function will follow the path and return the directory object
-// to the last found folder. 
+/// Follows the `path` and returns the `dir` object pointing to the last found 
+/// folder. If not found the functions returns `0`, but the `dir` object may
+/// still be changed
+/// 
+/// Path should be on the form: C:/home/usr/bin/chrome.exe
 static fstatus fat_follow_path(struct dir_s* dir, const char* path, u32 length) {
 	
-	// Get the right volume from the path
+	// Volume object is determined from the first character
 	struct volume_s* vol = volume_get(*path++);
 	if (vol == NULL) {
 		return FSTATUS_NO_VOLUME;
 	}
-	// Update the dir info with the root cluster data
+	// Rewind the `dir` object to the root directory
 	dir->vol = vol;
-	dir->sector = vol->root_lba;
-	dir->start_sect = vol->root_lba;
+	dir->start_sect = dir->sector = vol->root_lba;
 	dir->cluster = fat_clust_to_sect(vol, vol->root_lba);
 	dir->rw_offset = 0;
 	
 	// Check for the colon
-	if (*path != ':') {
+	if (*path++ != ':') {
 		return FSTATUS_PATH_ERR;
 	}
-	path++;
 	if (*path != '/') {
 		return FSTATUS_PATH_ERR;
 	}
 	
-	// These variables with hold the temporarily fragmented name
+	// `frag_ptr` and `frag_size` will contain one fragment of the path name
 	const char* frag_ptr;
 	u8 frag_size;
-
 	while (1) {
 		
-		// Interate the path until a backslash is found
+		// Search for the first `/`
 		while (*path && (*path != '/')) {
 			path++;
 		}
+		// TODO: This is not right is it?
+		// Check if the next fragment exist
 		if (*path++ == '\0') break;
 		if (*path == '\0') break;
 		
-		// Path points to the first character in the name fragment
+		// `path` points to the first character in the name fragment
 		const char* tmp_ptr = path;
 		frag_ptr = path;
 		frag_size = 0;
 		
 		while ((*tmp_ptr != '\0') && (*tmp_ptr != '/')) {
 						
-			// The current name fragment is a file, However, the name fragment
-			// before it has been found. The dir is pointing to that entry. 
+			// The current fragment describes is a file, However, the name 
+			// fragment before it has been found
 			if (*tmp_ptr == '.') {
 				return FSTATUS_OK;
 			}
@@ -867,7 +893,7 @@ u8 disk_mount(disk_e disk) {
 				vol->total_size = fat_load32(mount_buffer + BPB_TOT_SECT_32);
 				
 				// Update FAT32 offsets that will be used by the driver
-				vol->info_lba = partitions[i].lba + fat_load16(mount_buffer +
+				vol->fsinfo_lba = partitions[i].lba + fat_load16(mount_buffer +
 					BPB_32_FSINFO);
 				vol->fat_lba = partitions[i].lba + fat_load16(mount_buffer + 
 					BPB_RSVD_CNT);
@@ -1018,7 +1044,7 @@ fstatus fat_dir_read(struct dir_s* dir, struct info_s* info) {
 				// LFN case
 				u8 name_offset = 13 * ((entry_ptr[0] & LFN_SEQ_MSK) - 1);
 				for (u8 i = 0; i < 13; i++) {
-					u8 tmp_char = entry_ptr[lfn_offsets[i]]; 
+					u8 tmp_char = entry_ptr[lfn_lut[i]]; 
 					if (!((tmp_char == 0x00) || (tmp_char == 0xFF))) {
 						info->name[name_offset + i] = tmp_char;
 						name_length++;
