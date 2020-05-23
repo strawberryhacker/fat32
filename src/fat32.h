@@ -1,11 +1,7 @@
 //------------------------------------------------------------------------------
+// MIT license
 // Copyright (c) 2020 Bjørn Brodtkorb
-//
-// This software is provided without warranty of any kind. Permission is 
-// granted, free of charge, to copy and modify this software, if this copyright
-// notice is included in all copies of the software.
 //------------------------------------------------------------------------------
-
 
 #ifndef FAT32_H
 #define FAT32_H
@@ -13,7 +9,7 @@
 #include "fat_types.h"
 #include "disk_interface.h"
 
-// Most of the FAT32 file system functions returns one of these status codes
+/// Most of the FAT32 file system functions returns one of these status codes
 typedef enum {
 	FSTATUS_OK,
 	FSTATUS_ERROR,
@@ -22,14 +18,13 @@ typedef enum {
 	FSTATUS_EOF
 } fstatus;
 
-
 struct volume_s {
-	// Volume info
 	struct volume_s* next;
 	
-	// The first label is 11-bytes and located in the BPB
-	// The sectondary label is introduced in the root directory
-	char label[11];
+	// The first label is 11-bytes and located in the BPB, while the sectondary
+	// label is introduced in the root directory. The BPB label contains 13 
+	// characters while the root label can contain 13 characters.
+	char label[13];
 	char letter;
 	
 	// FAT32 info
@@ -53,7 +48,6 @@ struct volume_s {
 	
 };
 
-
 struct dir_s {
 	u32 sector;
 	u32 cluster;
@@ -63,7 +57,6 @@ struct dir_s {
 	u32 size;
 	struct volume_s* vol;
 };
-
 
 struct file_s {
 	u32 sector;
@@ -75,8 +68,8 @@ struct file_s {
 	struct volume_s* vol;
 };
 
-// This structure will contain all information needed for a file or a folder. 
-// It is mainly used to read directory entries from a path
+/// This structure will contain all information needed for a file or a folder. 
+/// It is mainly used to read directory entries from a path
 struct info_s {
 	
 	// By default this code supports long file name entries (LFN) up to 
@@ -106,10 +99,10 @@ struct info_s {
 	// Contains the total size of a file or a folder
 	// A folder has 
 	u32 size;
-};
+}
 
-// The classical generic MBR located at sector zero at a MSD contains four 
-// partition fields. This structure describe one partition. 
+/// The classical generic MBR located at sector zero at a MSD contains four 
+/// partition fields. This structure describe one partition. 
 struct partition_s {
 	u32 lba;
 	u32 size;
@@ -117,6 +110,12 @@ struct partition_s {
 	u8 type;
 };
 
+/// Format structure
+struct fat_fmt_s {
+	u32 allocation_size;
+	u32 allignment;
+	u32 quick_format;
+};
 
 //------------------------------------------------------------------------------
 // Microsoft FAT32 spesification
@@ -125,7 +124,7 @@ struct partition_s {
 // for smaller systems.
 //------------------------------------------------------------------------------
 
-// MBR and boot sector
+/// MBR and boot sector
 #define MBR_BOOTSTRAP		0
 #define MBR_BOOTSTRAP_SIZE	446
 #define MBR_PARTITION		446
@@ -138,7 +137,7 @@ struct partition_s {
 #define PAR_LBA				8
 #define PAR_SIZE			12
 
-// Old BPB and BS
+/// Old BPB and BS
 #define BPB_JUMP_BOOT		0
 #define BPB_OEM				3
 #define BPB_SECTOR_SIZE		11
@@ -154,7 +153,7 @@ struct partition_s {
 #define BPB_HIDD_SECT		28
 #define BPB_TOT_SECT_32		32
 
-// New BPB and BS applying for FAT12 and FAT16
+/// New BPB and BS applying for FAT12 and FAT16
 #define BPB_16_DRV_NUM		36
 #define BPB_16_RSVD1		37
 #define BPB_16_BOOT_SIG		38
@@ -177,69 +176,67 @@ struct partition_s {
 #define BPB_32_VOL_LABEL	71
 #define BPB_32_FSTYPE		82
 
-// Directory entry defines
-#define SFN_NAME		0
-#define SFN_ATTR		11
-#define SFN_NTR			12
-#define SFN_CTIME_TH	13
-#define SFN_CTIME		14
-#define SFN_CDATE		16
-#define SFN_ADATE		18
-#define SFN_CLUSTH		20
-#define SFN_WTIME		22
-#define SFN_WDATE		24
-#define SFN_CLUSTL		26
-#define SFN_FILE_SIZE	28
+/// Directory entry defines
+#define SFN_NAME			0
+#define SFN_ATTR			11
+#define SFN_NTR				12
+#define SFN_CTIME_TH		13
+#define SFN_CTIME			14
+#define SFN_CDATE			16
+#define SFN_ADATE			18
+#define SFN_CLUSTH			20
+#define SFN_WTIME			22
+#define SFN_WDATE			24
+#define SFN_CLUSTL			26
+#define SFN_FILE_SIZE		28
 
-#define LFN_SEQ		0
-#define LFN_SEQ_MSK	0x1F
-#define LFN_NAME_1	1
-#define LFN_ATTR	11
-#define LFN_TYPE	12
-#define LFN_CRC		13
-#define LFN_NAME_2	14
-#define LFN_NAME_3	28
+#define LFN_SEQ				0
+#define LFN_SEQ_MSK			0x1F
+#define LFN_NAME_1			1
+#define LFN_ATTR			11
+#define LFN_TYPE			12
+#define LFN_CRC				13
+#define LFN_NAME_2			14
+#define LFN_NAME_3			28
 
-#define ATTR_RO			0x01
-#define ATTR_HIDD		0x02
-#define ATTR_SYS		0x04
-#define ATTR_VOL_LABEL	0x08
-#define ATTR_DIR		0x10
-#define ATTR_ARCH		0x20
-#define ATTR_LFN		0x0F
+#define ATTR_RO				0x01
+#define ATTR_HIDD			0x02
+#define ATTR_SYS			0x04
+#define ATTR_VOL_LABEL		0x08
+#define ATTR_DIR			0x10
+#define ATTR_ARCH			0x20
+#define ATTR_LFN			0x0F
 
-// FSinfo structure
-#define INFO_CLUST_CNT			488
-#define INFO_CLUST_NEXT_FREE	492
+/// FSinfo structure
+#define INFO_CLUST_CNT		488
+#define INFO_NEXT_FREE		492
 
-
-// File system thread
+/// File system thread
 void fat32_thread(void* arg);
 
-// Disk functions
+/// Disk functions
 u8 disk_mount(disk_e disk);
 u8 disk_eject(disk_e disk);
 
-// Volume functions
+/// Volume functions
 struct volume_s* volume_get_first(void);
 struct volume_s* volume_get(char letter);
 fstatus volume_set_label(struct volume_s* vol, const char* name, u8 length);
 fstatus volume_get_label(struct volume_s* vol, char* name);
-fstatus volume_format(struct volume_s* vol);
+fstatus volume_format(struct volume_s* vol, struct fat_fmt_s* fmt);
 
-// FAT32 directory actions
+/// FAT32 directory actions
 fstatus fat_dir_open(struct dir_s* dir, const char* path, u16 length);
 fstatus fat_dir_close(struct dir_s* dir);
 fstatus fat_dir_read(struct dir_s* dir, struct info_s* info);
 fstatus fat_dir_make(const char* path);
 fstatus fat_dir_rename(struct dir_s* dir, const char* name, u8 length);
 
-// FAT32 file actions
+/// FAT32 file actions
 fstatus fat_file_open(struct file_s* file, const char* path, u16 length);
 fstatus fat_file_close(struct file_s* file);
 fstatus fat_file_read(struct file_s* file, u8* buffer, u32 count, u32* status);
 fstatus fat_file_write(struct file_s* file, const u8* buffer, u32 count);
 fstatus fat_file_jump(struct file_s* file, u32 offset);
-
 
 #endif
