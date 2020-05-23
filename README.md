@@ -11,7 +11,7 @@ A small disk interface layer is required in order for the FAT32 driver to work. 
  - **disk write** - this will write a specified number of sectors to the stordage device
  - **get time** - get the current time from a RTC or over NTP (optional)
 
-These functions take in a number which is associated with each disk. The FAT32 disk mount functions will take in the same disk number. For example, if an SD card is referenced in the disk interface as device 2, then disk_mount(2) will mount the SD card.
+These functions take in a number which is associated with each disk. The FAT32 disk mount functions will take in the same disk number. For example, if an SD card is referenced in the disk interface as device 2, then disk_mount(2) will mount the SD card. Take a look at the disk_interface.c for some examples.
 
 ## Functionality
 
