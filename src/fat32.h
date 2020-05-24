@@ -1,6 +1,6 @@
 //------------------------------------------------------------------------------
 // MIT license
-// Copyright (c) 2020 Bjørn Brodtkorb
+// Copyright (c) 2020 StrawberryHacker
 //------------------------------------------------------------------------------
 
 #ifndef FAT32_H
@@ -225,18 +225,23 @@ fstatus volume_set_label(struct volume_s* vol, const char* name, u8 length);
 fstatus volume_get_label(struct volume_s* vol, char* name);
 fstatus volume_format(struct volume_s* vol, struct fat_fmt_s* fmt);
 
-/// FAT32 directory actions
+/// Directory actions
 fstatus fat_dir_open(struct dir_s* dir, const char* path, u16 length);
 fstatus fat_dir_close(struct dir_s* dir);
 fstatus fat_dir_read(struct dir_s* dir, struct info_s* info);
 fstatus fat_dir_make(const char* path);
-fstatus fat_dir_rename(struct dir_s* dir, const char* name, u8 length);
 
-/// FAT32 file actions
+/// File actions
 fstatus fat_file_open(struct file_s* file, const char* path, u16 length);
 fstatus fat_file_close(struct file_s* file);
 fstatus fat_file_read(struct file_s* file, u8* buffer, u32 count, u32* status);
 fstatus fat_file_write(struct file_s* file, const u8* buffer, u32 count);
 fstatus fat_file_jump(struct file_s* file, u32 offset);
+fstatus fat_file_flush(struct file_s* file);
+
+/// Directory and file actions
+fstatus fat_dir_rename(struct dir_s* dir, const char* name, u8 length);
+fstatus fat_dir_delete(struct dir_s* dir);
+fstatus fat_dir_chmod(struct dir_s* dir, const char* mod);
 
 #endif

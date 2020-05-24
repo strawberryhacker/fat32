@@ -1,6 +1,6 @@
 //------------------------------------------------------------------------------
 // MIT license
-// Copyright (c) 2020 Bjørn Brodtkorb
+// Copyright (c) 2020 StrawberryHacker
 //------------------------------------------------------------------------------
 
 #include "fat32.h"
@@ -48,7 +48,7 @@ static const struct clust_size_s cluster_size_lut[] = {
 };
 
 
-// Private prototypes
+/// Private prototypes
 static void fat_memcpy(const void* src, void* dest, u32 count);
 static u8 fat_memcmp(const void* src_1, const void* src_2, u32 count);
 static void fat_store32(void* dest, u32 value);
@@ -1264,3 +1264,7 @@ fstatus fat_file_jump(struct file_s* file, u32 offset) {
 	
 	return FSTATUS_OK;
 }
+
+fstatus fat_dir_delete(struct dir_s* dir);
+fstatus fat_dir_chmod(struct dir_s* dir, const char* mod);
+fstatus fat_file_flush(struct file_s* file);
