@@ -14,7 +14,6 @@ u8 disk_get_status(disk_e disk) {
 	switch (disk) {
 		case DISK_SD_CARD: {
 			return (u8)board_sd_card_get_status();
-			break;
 		}
 	}
 	return 0;
@@ -24,7 +23,6 @@ u8 disk_initialize(disk_e disk) {
 	switch (disk) {
 		case DISK_SD_CARD: {
 			return (u8)sd_protocol_config(&sd_slot_1);
-			break;
 		}
 	}
 	return 0;
@@ -34,7 +32,6 @@ u8 disk_read(disk_e disk, u8* buffer, u32 lba, u32 count) {
 	switch (disk) {
 		case DISK_SD_CARD: {
 			return sd_protocol_read(&sd_slot_1, buffer, lba, count);
-			break;
 		}
 	}
 	return 0;
@@ -44,7 +41,6 @@ u8 disk_write(disk_e disk, const u8* buffer, u32 lba, u32 count) {
 	switch (disk) {
 		case DISK_SD_CARD: {
 			return sd_protocol_write(&sd_slot_1, buffer, lba, count);
-			break;
 		}
 	}
 	return 0;
