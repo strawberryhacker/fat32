@@ -1,6 +1,6 @@
 # FAT32
 
-This repository contains a minimal implementation of the FAT32 file system written in C. Its under 2K lines of code. It supports the most basic functions as well as reading and writing. 
+This repository contains a minimal implementation of the FAT32 file system written in C. Its a little over 1K lines of code. It supports the most basic functions as well as reading and writing. 
 
 The implementation buffers data in both the files and file system. Make sure to call `fat_fclose` and `fat_umount` after doing operations.
 
