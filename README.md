@@ -1,6 +1,6 @@
 # FAT32
 
-This repository contains a minimal implementation of the FAT32 file system written in C with no dependencies. Just copy the fat.c and fat.h files. Its a little over 1K lines of code. It supports the most basic functions as well as reading and writing. 
+This repository contains a minimal implementation of the FAT32 file system written in C with no dependencies. Just copy the fat.c and fat.h files. Its a little over 1K lines of code. It supports the most basic functions as well as reading and writing. It fully supports LFN extension. When creating files, regardless of filename length, they are created as LFN.
 
 The implementation buffers data in both the files and file system. Make sure to call `fat_fclose` and `fat_umount` after doing operations. If you dont need fprintf functionality, you can remove `fat_fprintf` and all functions and enums prefixed with `fmt_xxx` in `fat.c`.
 
