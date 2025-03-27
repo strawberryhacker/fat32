@@ -31,7 +31,7 @@ losetup -d /dev/loopX
 
 ## Paths
 
-When mounting a file system you must specify a path. This must be used when accessing the file system. For example, if you mount in `usb`, you must use `/usb/path` to access it. The `fat_opendir` supports relative paths. You can use both . and .. in the path. 
+When mounting a file system you must specify a name. If you want to mount multiple file systems e.g. using multiple partitions, you must use unique names. The name is used when accessing the file system. For example, if you mount in `mnt`, you must use `/mnt/path` to access it. The `fat_opendir` supports relative paths. You can use both . and .. in the path. Note that if you have not opened a directory, the path must be absolute and start with `/`.
 
 ## Porting
 
