@@ -556,7 +556,8 @@ static uint32_t clust_to_sect(fat_t* fat, uint32_t clust)
 //------------------------------------------------------------------------------
 static int get_fat(fat_t* fat, uint32_t clust, uint32_t* res)
 {
-  uint32_t sect = fat->fat_sect + clust / 128;
+  // Assume first FAT is correct
+  uint32_t sect = fat->fat_sect[0] + clust / 128;
   uint32_t off = (clust % 128) << 2;
 
   int err = move_win(fat, sect);
@@ -570,9 +571,9 @@ static int get_fat(fat_t* fat, uint32_t clust, uint32_t* res)
 }
 
 //------------------------------------------------------------------------------
-static int put_fat(fat_t* fat, uint32_t clust, uint32_t val)
+static int put_fat_in(fat_t* fat, int idx, uint32_t clust, uint32_t val)
 {
-  uint32_t sect = fat->fat_sect + clust / 128;
+  uint32_t sect = fat->fat_sect[idx] + clust / 128;
   uint32_t off = 4 * (clust % 128);
 
   int err = move_win(fat, sect);
@@ -585,6 +586,16 @@ static int put_fat(fat_t* fat, uint32_t clust, uint32_t val)
   fat->win_dirty = true;
 
   return FAT_ERR_NONE;
+}
+
+//------------------------------------------------------------------------------
+static int put_fat(fat_t* fat, uint32_t clust, uint32_t val)
+{
+  int err = put_fat_in(fat, 0, clust, val);
+  if (err)
+    return err;
+  
+  return put_fat_in(fat, 1, clust, val);
 }
 
 //------------------------------------------------------------------------------
@@ -640,7 +651,7 @@ static int clust_chain_remove(fat_t* fat, uint32_t clust)
     if (err)
       return err;
     
-    fat->info_cnt--;
+    fat->info_cnt++;
     clust = next;
 
     if (status & CLUST_LAST)
@@ -939,7 +950,7 @@ static int load_lfn_name(fat_t* fat, dir_t* dir)
 }
 
 //------------------------------------------------------------------------------
-static int dir_search(fat_t* fat, dir_t* dir, const char* name, int len)
+static int dir_search(fat_t* fat, dir_t* dir, const char* name, int len, dir_t* start)
 {
   dir_rewind(fat, dir);
 
@@ -956,8 +967,15 @@ static int dir_search(fat_t* fat, dir_t* dir, const char* name, int len)
 
     if (!dir_ent_is_free(ent))
     {
+      if (start)
+      {
+        start->sect = dir->sect;
+        start->idx = dir->idx;
+      }
+
       if (dir_ent_is_lfn(ent))
       {
+
         err = load_lfn_name(fat, dir);
         if (err)
           return err;
@@ -1036,7 +1054,7 @@ static int follow_path(dir_t* dir, const char** path)
     if (len == 0)
       return FAT_ERR_NONE;
 
-    err = dir_search(fat, dir, str, len);
+    err = dir_search(fat, dir, str, len, NULL);
     if (err)
       return err;
       
@@ -1239,8 +1257,9 @@ int fat_mount(disk_ops_t* ops, int part_num, fat_t* fat, const char* path)
   fat->sect_per_clust = bpb->sect_per_clust;
   fat->clust_cnt = bpb->sect_per_fat_32 * 128;
   fat->info_sect = part.lba + bpb->info_sect;
-  fat->fat_sect  = part.lba + bpb->res_sect_cnt;
-  fat->data_sect = fat->fat_sect + bpb->fat_cnt * bpb->sect_per_fat_32;
+  fat->fat_sect[0] = part.lba + bpb->res_sect_cnt;
+  fat->fat_sect[1] = fat->fat_sect[0] + bpb->sect_per_fat_32;
+  fat->data_sect = fat->fat_sect[0] + bpb->fat_cnt * bpb->sect_per_fat_32;
   fat->root_sect = clust_to_sect(fat, bpb->root_cluster);
 
   err = move_win(fat, fat->info_sect);
@@ -1259,7 +1278,7 @@ int fat_mount(disk_ops_t* ops, int part_num, fat_t* fat, const char* path)
   
   fat->info_last = info->next_free;
   fat->info_cnt  = info->free_cnt;
-  
+
   int path_len = strlen(path);
   if (sizeof(fat->path) < path_len)
     return FAT_ERR_PARAM;
@@ -1346,13 +1365,13 @@ int fat_fopen(file_t* file, const char* path, const char* mode)
   if (len == 0 || path[len])
     return FAT_ERR_PATH;
 
-  err = dir_search(fat, dir, path, len);
+  err = dir_search(fat, dir, path, len, NULL);
 
   if (err == FAT_ERR_EOF)
   {
     if (!create)
       return FAT_ERR_DENIED;
-    
+
     // Create a new file
     uint32_t new;
     err = clust_chain_create(fat, &new);
@@ -1641,8 +1660,9 @@ int fat_unlink(const char* path)
     return FAT_ERR_PATH;
 
   fat_t* fat = dir.fat;
+  dir_t sdir = dir;
 
-  err = dir_search(fat, &dir, path, len);
+  err = dir_search(fat, &dir, path, len, &sdir);
   if (err)
     return err;
   
@@ -1652,8 +1672,23 @@ int fat_unlink(const char* path)
   if (err)
     return err;
 
-  ent->name[0] = SFN_FREE;
-  fat->win_dirty = true;
+  for (;;)
+  {
+    err = move_win(fat, sdir.sect);
+    if (err)
+      return err;
+
+    dir_ent_t* ent = (dir_ent_t*)(fat->win + sdir.idx);
+    ent->name[0] = SFN_FREE;
+    fat->win_dirty = true;
+
+    if (sdir.sect == dir.sect && sdir.idx == dir.idx)
+      break;
+    
+    err = dir_next(fat, &sdir);
+    if (err)
+      return err;
+  }
 
   return sync_fat(fat);
 }
@@ -1667,10 +1702,14 @@ int fat_mkdir(const char* path)
     return err;
   
   fat_t* fat = dir.fat;
-  
+
   int len = subpath_len(path);
   if (len == 0 || path[len])
     return FAT_ERR_PATH;
+
+  uint32_t prev = dir.first_clust;
+  if (prev == 2) // Old cluster is the root directory
+    prev = 0;
 
   // Create a new directory
   uint32_t new;
@@ -1705,8 +1744,8 @@ int fat_mkdir(const char* path)
 
   memcpy(ent + 1, ent, sizeof(dir_ent_t));
   ent[1].name[1] = '.';
-  ent[1].clust_hi = dir.first_clust >> 16;
-  ent[1].clust_lo = dir.first_clust & 0xffff;
+  ent[1].clust_hi = prev >> 16;
+  ent[1].clust_lo = prev & 0xffff;
 
   err = dir_register(fat, &dir, path, len, FAT_ATTR_DIR, new);
   if (err)

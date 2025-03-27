@@ -74,7 +74,7 @@ typedef struct fat_t
   uint32_t sect_per_clust;
   uint32_t clust_cnt;
   uint32_t info_sect;
-  uint32_t fat_sect;
+  uint32_t fat_sect[2];
   uint32_t data_sect;  
   uint32_t root_sect;
 
