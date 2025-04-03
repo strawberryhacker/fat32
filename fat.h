@@ -5,21 +5,16 @@
 #define FAT_H
 
 //------------------------------------------------------------------------------
-#include <stdbool.h>
 #include <stdint.h>
-#include <stdio.h>
-#include <stdarg.h>
-
-//------------------------------------------------------------------------------
-#define SECT_SIZE 512
+#include <stdbool.h>
 
 //------------------------------------------------------------------------------
 enum
 {
   FAT_ERR_NONE     =  0,
   FAT_ERR_NOFAT    = -1,
-  FAT_ERR_BROKEN  = -2,
-  FAT_ERR_DISK     = -3,
+  FAT_ERR_BROKEN   = -2,
+  FAT_ERR_IO     = -3,
   FAT_ERR_PARAM    = -4,
   FAT_ERR_PATH     = -5,
   FAT_ERR_EOF      = -6,
@@ -41,9 +36,22 @@ enum
 
 enum
 {
-  FAT_SEEK_SET,
-  FAT_SEEK_END,
+  FAT_WRITE      = 0x01, // Open file for writing
+  FAT_READ       = 0x02, // Open file for reading
+  FAT_APPEND     = 0x04, // Set file offset to the end of the file
+  FAT_TRUNC      = 0x08, // Truncate the file after opening
+  FAT_CREATE     = 0x10, // Create the file if it do not exist
+
+  FAT_ACCESSED   = 0x20, // do not use (internal)
+  FAT_MODIFIED   = 0x40, // do not use (internal)
+  FAT_FILE_DIRTY = 0x80, // do not use (internal)
+};
+
+enum
+{
+  FAT_SEEK_START,
   FAT_SEEK_CURR,
+  FAT_SEEK_END,
 };
 
 //------------------------------------------------------------------------------
@@ -51,109 +59,96 @@ typedef struct
 {
   bool (*read)(uint8_t* buf, uint32_t sect);
   bool (*write)(const uint8_t* buf, uint32_t sect);
-} disk_ops_t;
+} DiskOps;
 
 typedef struct
 {
   uint8_t hour;
   uint8_t min;
   uint8_t sec;
-
   uint8_t day;
   uint8_t month;
   uint16_t year;
-} timestamp_t;
+} Timestamp;
 
-typedef struct fat_t
+typedef struct Fat
 {
-  struct fat_t* next;
-  disk_ops_t ops;
-  char path[32];
-  int pathlen;
-
-  uint32_t sect_per_clust;
+  struct Fat* next;
+  DiskOps ops;
+  uint32_t clust_msk;
   uint32_t clust_cnt;
   uint32_t info_sect;
   uint32_t fat_sect[2];
   uint32_t data_sect;  
-  uint32_t root_sect;
-
-  uint32_t info_last;
-  uint32_t info_cnt;
-  bool info_dirty;
-
-  uint8_t win[SECT_SIZE];
-  uint32_t win_sect;
-  bool win_dirty;
-  
-  uint8_t name[260];
-  int namelen;
-  uint8_t crc;
-} fat_t;
+  uint32_t root_clust;
+  uint32_t last_used;
+  uint32_t free_cnt;
+  uint32_t sect;
+  uint8_t buf[512];
+  uint8_t flags;
+  uint8_t clust_shift;
+  uint8_t name_len;
+  char name[32];
+} Fat;
 
 typedef struct
 {
-  timestamp_t created;
-  timestamp_t modified;
-
+  Timestamp created;
+  Timestamp modified;
   uint32_t size;
   uint8_t attr;
-
-  char name[256];
-  int namelen;
-} dir_info_t;
-
-typedef struct
-{
-  fat_t* fat;
-  uint8_t attr;
-  uint32_t first_clust;
-  uint32_t clust;
-  uint32_t sect;
-  int idx;
-} dir_t;
+  char name[255];
+  uint8_t name_len;
+} DirInfo;
 
 typedef struct
 {
-  dir_t dir;
-  uint32_t first_clust;
+  Fat* fat;
+  uint32_t sclust;
   uint32_t clust;
   uint32_t sect;
-  uint32_t off;
+  uint16_t idx;
+} Dir;
+
+typedef struct
+{
+  Fat* fat;
+  uint32_t dir_sect;
+  uint32_t sclust;
+  uint32_t clust;
+  uint32_t sect;
   uint32_t size;
-
-  uint8_t buf[SECT_SIZE];
-  uint32_t buf_sect;
-  bool buf_dirty;
-
-  bool modified;
-  bool accessed;
-  bool read;
-  bool write;
-} file_t;
+  uint32_t offset;
+  uint16_t dir_idx;
+  uint8_t attr;
+  uint8_t flags;
+  uint8_t buf[512];
+} File;
 
 //------------------------------------------------------------------------------
-int fat_mount(disk_ops_t* ops, int part_num, fat_t* fs, const char* path);
-int fat_umount(fat_t* fs);
-
-int fat_fopen(file_t* file, const char* path, const char* mode);
-int fat_fclose(file_t* file);
-int fat_fread(file_t* file, void* buf, int len);
-int fat_fwrite(file_t* file, const void* buf, int len);
-int fat_fprintf(file_t* file, const char* str, ...);
-int fat_fseek(file_t* file, int offset, int seek);
-int fat_ftell(file_t* file);
-int fat_fsize(file_t* file);
-int fat_fsync(file_t* file);
-int fat_unlink(const char* path);
-
-int fat_mkdir(const char* path);
-int fat_opendir(dir_t* dir, const char* path);
-int fat_readdir(dir_t* dir, dir_info_t* info);
-int fat_nextdir(dir_t* dir);
-
 const char* fat_get_error(int err);
 
-void fat_get_timestamp(timestamp_t* dt);
+int fat_probe(DiskOps* ops, int partition);
+int fat_mount(DiskOps* ops, int partition, Fat* fat, const char* path);
+int fat_umount(Fat* fat);
+int fat_sync(Fat* fat);
+
+int fat_stat(const char* path, DirInfo* info);
+int fat_unlink(const char* path);
+
+int fat_file_open(File* file, const char* path, uint8_t flags);
+int fat_file_close(File* file);
+int fat_file_read(File* file, void* buf, int len, int* bytes);
+int fat_file_write(File* file, const void* buf, int len, int* bytes);
+int fat_file_seek(File* file, int offset, int seek);
+int fat_file_sync(File* file);
+
+int fat_dir_create(Dir* dir, const char* path);
+int fat_dir_open(Dir* dir, const char* path);
+int fat_dir_read(Dir* dir, DirInfo* info);
+int fat_dir_rewind(Dir* dir);
+int fat_dir_next(Dir* dir);
+
+void fat_get_timestamp(Timestamp* ts);
 
 #endif

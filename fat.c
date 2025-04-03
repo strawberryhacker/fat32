@@ -1,23 +1,36 @@
 // SPDX-License-Identifier: BSD-3-Clause
 // Copyright (c) 2025, Bjørn Brodtkorb. All rights reserved.
 
-#include <string.h>
 #include "fat.h"
+#include <string.h>
 
 //------------------------------------------------------------------------------
 #define LIMIT(a, b) ((a) < (b) ? (a) : (b))
 
-#define FSINFO_HEAD_SIG 0x41615252
-#define FSINFO_STRUCT_SIG 0x61417272
-#define FSINFO_TAIL_SIG 0xaa550000
+#define FSINFO_HEAD_SIG    0x41615252
+#define FSINFO_STRUCT_SIG  0x61417272
+#define FSINFO_TAIL_SIG    0xaa550000
 
-#define LFN_FIRST 0x40
-#define LFN_SEQ_MASK 0x1f
+#define MBR_PART_OFF  446
 
-#define SFN_FREE 0xe5
-#define SFN_LAST 0x00
+#define EXT_FLAG_MIRROR  (1 << 7)
+#define EXT_FLAG_ACT     0x000f
+#define EXT_FLAG_SECOND  0x0001
+
+#define LFN_HEAD_MSK  0x40
+#define LFN_SEQ_MSK   0x1f
+
+#define SFN_FREE  0xe5
+#define SFN_LAST  0x00
+#define SFN_PAD   0x20
 
 //------------------------------------------------------------------------------
+enum
+{
+  FAT_BUF_DIRTY  = 0x01,
+  FAT_INFO_DIRTY = 0x02,
+};
+
 enum
 {
   CLUST_FREE = 0x01,
@@ -47,15 +60,20 @@ enum
 };
 
 //------------------------------------------------------------------------------
-typedef struct
+typedef struct __attribute__((packed))
 {
-  uint8_t status;
-  uint8_t not_used0[3];
-  uint8_t type;
-  uint8_t not_used1[3];
-  uint32_t lba;
-  uint32_t size;
-} mbr_part_t;
+  uint8_t boot[446];
+  struct
+  {
+    uint8_t status;
+    uint8_t reserved_0[3];
+    uint8_t type;
+    uint8_t reserved_1[3];
+    uint32_t lba;
+    uint32_t size;
+  } part[4];
+  uint16_t sig;
+} Mbr;
 
 typedef struct __attribute__((packed))
 {
@@ -74,33 +92,33 @@ typedef struct __attribute__((packed))
   uint32_t hidden_sect_cnt;
   uint32_t sect_cnt_32;
   uint32_t sect_per_fat_32;
-  uint16_t flags;
+  uint16_t ext_flags;
   uint8_t minor;
   uint8_t major;
   uint32_t root_cluster;
   uint16_t info_sect;
   uint16_t copy_bpb_sector;
-  uint8_t reserved0[12];
+  uint8_t reserved_0[12];
   uint8_t drive_num;
-  uint8_t reserved1;
+  uint8_t reserved_1;
   uint8_t boot_sig;
   uint32_t volume_id;
   char volume_label[11];
   char fs_type[8];
-  uint8_t reserved2[420];
+  uint8_t reserved_2[420];
   uint8_t sign[2];
-} bpb_t;
+} Bpb;
 
 typedef struct __attribute__((packed))
 {
   uint32_t head_sig;
-  uint8_t reserved0[480];
+  uint8_t reserved_0[480];
   uint32_t struct_sig;
   uint32_t free_cnt;
   uint32_t next_free;
-  uint8_t reserved1[12];
+  uint8_t reserved_1[12];
   uint32_t tail_sig;
-} fsinfo_t;
+} FsInfo;
 
 typedef struct __attribute__((packed))
 {
@@ -108,290 +126,51 @@ typedef struct __attribute__((packed))
   uint8_t attr;
   uint8_t reserved;
   uint8_t tenth;
-  uint16_t create_time;
-  uint16_t create_date;
-  uint16_t access_date;
+  uint16_t cre_time;
+  uint16_t cre_date;
+  uint16_t acc_date;
   uint16_t clust_hi;
-  uint16_t modify_time;
-  uint16_t modify_date;
+  uint16_t mod_time;
+  uint16_t mod_date;
   uint16_t clust_lo;
   uint32_t size;
-} dir_ent_t;
+} Sfn;
 
-typedef struct __attribute__((packed))
+typedef union __attribute__((packed))
 {
-  uint8_t seq;
-  uint8_t name0[10];
-  uint8_t attr;
-  uint8_t type;
-  uint8_t crc;
-  uint8_t name1[12];
-  uint16_t clust;
-  uint8_t name2[4];
-} lfn_ent_t;
+  uint8_t raw[32];
+  struct
+  {
+    uint8_t seq;
+    uint8_t name0[10];
+    uint8_t attr;
+    uint8_t type;
+    uint8_t crc;
+    uint8_t name1[12];
+    uint16_t clust;
+    uint8_t name2[4];
+  };
+} Lfn;
+
+typedef struct
+{
+  uint32_t sect;
+  uint16_t idx;
+} Loc;
 
 //------------------------------------------------------------------------------
-static fat_t* g_fat_list;
-static uint8_t g_lfn_pos[13] = {1, 3, 5, 7, 9, 14, 16, 18, 20, 22, 24, 28, 30};
+static Fat* g_fat_list;
 
-//------------------------------------------------------------------------------
-static bool fmt_printable(char c)
-{
-  return ' ' <= c && c <= '~';
-}
+static uint8_t g_lfn_indices[13] = {1, 3, 5, 7, 9, 14, 16, 18, 20, 22, 24, 28, 30};
 
-//------------------------------------------------------------------------------
-static void fmt_put(char** buf, char* end, char c)
-{
-  if (*buf != end)
-    *(*buf)++ = c; 
-}
-
-//------------------------------------------------------------------------------
-static void fmt_put_num(long long val, int flags, int width, char** buf, char* end)
-{
-  unsigned long long uval = (unsigned long long)val;
-  int size = 0;
-  char tmp[65]; // Binary digits in uint64_t plus sign
-  
-  char* hex = flags & FMT_UPPER ? "0123456789ABCDEF" : "0123456789abcdef";
-  char pad = flags & FMT_ZERO ? '0' : ' ';
-  int base = flags & FMT_HEX ? 16 : flags & FMT_BIN ? 2 : 10;
-  char sign = 0;
-
-  if (!(flags & FMT_UNSIGNED) && val < 0)
-  {
-    uval = (unsigned long long)-val;
-    if (!(flags & FMT_NO_SIGN))
-      sign = '-';
-  }
-  else if (flags & FMT_SIGN)
-  {
-    sign = '+';
-  }
-
-  do
-  {
-    tmp[size++] = hex[uval % base];
-    uval /= base;
-  } while (uval);
-
-  if (sign)
-    tmp[size++] = sign;
-
-  int pad_size = width - size;
-  if (!(flags & FMT_LEFT))
-  {
-    while (--pad_size >= 0)
-      fmt_put(buf, end, pad);
-  }
-  
-  while (size--)
-    fmt_put(buf, end, tmp[size]);
-
-  while (--pad_size >= 0)
-    fmt_put(buf, end, pad);
-}
-
-//------------------------------------------------------------------------------
-static void fmt_put_str(char* str, int flags, int width, char** buf, char* end)
-{
-  char pad = flags & FMT_ZERO ? '0' : ' ';
-  if (!str)
-    str = "NULL";
-
-  int size = 0;
-  while (str[size])
-    size++;
-
-  int pad_size = width - size;
-  if (!(flags & FMT_LEFT))
-  {
-    while (--pad_size >= 0)
-      fmt_put(buf, end, pad);
-  }
-
-  while (size--)
-  {
-    char c = *str++;
-    // Some terminals require CR to reset line offset
-    if (c == '\n')
-      fmt_put(buf, end, '\r');
-    fmt_put(buf, end, fmt_printable(c) ? c : '?');
-  }
-
-  while (--pad_size >= 0)
-    fmt_put(buf, end, pad);
-}
-
-//------------------------------------------------------------------------------
-int fmt_va(char* buf, int size, const char* fmt, va_list va)
-{
-  char* start = buf;
-  char* end = buf + size;
-
-  while (*fmt)
-  {
-    char c = *fmt++;
-    if (c != '%')
-    {
-      if (c == '\n')
-        fmt_put(&buf, end, '\r');
-      fmt_put(&buf, end, c);
-      continue;
-    }
-
-    int flags = 0;
-    int width = 0;
-    int prec = 0;
-
-    for (c = *fmt++;; c = *fmt++)
-    {
-      if (c == '0')
-        flags |= FMT_ZERO;
-      else if (c == '-')
-        flags |= FMT_LEFT;
-      else if (c == ' ')
-        flags |= FMT_NO_SIGN;
-      else if (c == '+')
-        flags |= FMT_SIGN;
-      else if (c == '*')
-      {
-        width = va_arg(va, int);
-        if (width < 0)
-        {
-          width = -width;
-          flags |= FMT_LEFT;
-        }
-      }
-      else
-        break;
-    }
-
-    for (; '0' <= c && c <= '9'; c = *fmt++)
-      width = 10 * width + (c - '0');
-    
-    if (c == '.')
-    {
-      c = *fmt++;
-      for (; '0' <= c && c <= '9'; c = *fmt++)
-        prec = 10 * prec + (c - '0');
-    }
-
-    for (;; c = *fmt++)
-    {
-      if (c == 'h')
-        flags |= (flags & FMT_SHORT) ? FMT_SHORT_SHORT : FMT_SHORT;
-      else if (c == 'l')
-        flags |= (flags & FMT_LONG) ? FMT_LONG_LONG : FMT_LONG;
-      else
-        break;
-    }
-
-    switch (c)
-    {
-    case 'u':
-      flags |= FMT_UNSIGNED;
-    case 'd':
-    case 'i': 
-      flags |= FMT_NUM;
-      break;
-    case 'X':
-      flags |= FMT_UPPER;
-    case 'x':
-      flags |= FMT_NUM | FMT_UNSIGNED | FMT_HEX;
-      break;
-    case 'f':
-      flags |= FMT_FLOAT;
-      break;
-    case 'b':
-    case 'B':
-      flags |= FMT_UNSIGNED | FMT_NUM | FMT_BIN;
-      break;
-    case 'c':
-      flags |= FMT_CHAR;
-      break;
-    case 's':
-      flags |= FMT_STR;
-      break;
-    default:
-      fmt_put(&buf, end, c);
-      break;
-    }
-
-    if (flags & FMT_NUM)
-    {
-      long long val;
-
-      if (flags & FMT_LONG_LONG)
-        val = va_arg(va, long long);
-      else if (flags & FMT_LONG)
-        val = va_arg(va, long);
-      else
-        val = va_arg(va, int);
-      
-      if (flags & FMT_UNSIGNED)
-      {
-        if (flags & FMT_LONG_LONG)
-          val = (unsigned long long)val;
-        else if (flags & FMT_LONG)
-          val = (unsigned long)val;
-        else
-          val = (unsigned int)val;
-      }
-
-      fmt_put_num(val, flags, width, &buf, end);
-    }
-    else if (flags & FMT_FLOAT)
-    {
-      int mult = 1;
-      for (int i = 0; i < prec; i++)
-        mult *= 10;
-
-      double val = va_arg(va, double);
-      int i = (int)val;
-      int f = (int)((val - i) * mult);
-
-      fmt_put_num(i, flags, width, &buf, end);
-      if (prec)
-      {
-        fmt_put(&buf, end, '.');
-        fmt_put_num(f, flags | FMT_ZERO, prec, &buf, end);
-      }
-    }
-    else if (flags & FMT_CHAR)
-    {
-      char str[2];
-      str[0] = (char)va_arg(va, int);
-      str[1] = 0;
-      fmt_put_str(str, flags, width, &buf, end);
-    }
-    else if (flags & FMT_STR)
-    {
-      char* str = va_arg(va, char*);
-      fmt_put_str(str, flags, width, &buf, end);
-    }
-  }
-
-  return buf - start;
-}
+static uint8_t g_buf[512];
+static uint16_t g_len;
+static uint8_t g_crc;
 
 //------------------------------------------------------------------------------
 static char to_upper(char c)
 {
   return (c >= 'a' && c <= 'z') ? c & ~0x20 : c;
-}
-
-//------------------------------------------------------------------------------
-static int memcmp_upper(const char* a, const char* b, int len)
-{
-  for (int i = 0; i < len; i++)
-  {
-    if (to_upper(a[i]) != to_upper(b[i]))
-      return 1;
-  }
-
-  return 0;
 }
 
 //------------------------------------------------------------------------------
@@ -403,7 +182,23 @@ static int subpath_len(const char* path)
 }
 
 //------------------------------------------------------------------------------
-static uint8_t calc_crc(uint8_t* name)
+static int last_subpath_len(const char* path)
+{
+  int len = subpath_len(path);
+  if (len == 0)
+    return 0;
+
+  path += len;
+
+  // Verify last subpath
+  while (*path == '/')
+    path++;
+
+  return *path ? 0 : len;
+}
+
+//------------------------------------------------------------------------------
+static uint8_t get_crc(const uint8_t* name)
 {
   uint8_t sum = 0;
   for (int i = 0; i < 11; i++)
@@ -412,7 +207,7 @@ static uint8_t calc_crc(uint8_t* name)
 }
 
 //------------------------------------------------------------------------------
-static void get_timestamp(uint16_t date, uint16_t time, timestamp_t* ts)
+static void decode_timestamp(uint16_t date, uint16_t time, Timestamp* ts)
 {
   ts->day = date & 0x1f;
   ts->month = (date >> 5) & 0xf;
@@ -423,9 +218,9 @@ static void get_timestamp(uint16_t date, uint16_t time, timestamp_t* ts)
 }
 
 //------------------------------------------------------------------------------
-static void put_timestamp(uint16_t* date, uint16_t* time)
+static void encode_timestamp(uint16_t* date, uint16_t* time)
 {
-  timestamp_t ts;
+  Timestamp ts;
   fat_get_timestamp(&ts);
   
   *date = ((ts.year - 1980) & 0x3f) << 9 | (ts.month & 0xf) << 5 | (ts.day & 0x1f);
@@ -433,11 +228,11 @@ static void put_timestamp(uint16_t* date, uint16_t* time)
 }
 
 //------------------------------------------------------------------------------
-static fat_t* find_fat_volume(const char* path, int len)
+static Fat* find_fat_volume(const char* name, int len)
 {
-  for (fat_t* it = g_fat_list; it; it = it->next)
+  for (Fat* it = g_fat_list; it; it = it->next)
   {
-    if (len == it->pathlen && 0 == memcmp(path, it->path, len))
+    if (len == it->name_len && !memcmp(name, it->name, len))
       return it;
   }
 
@@ -445,395 +240,392 @@ static fat_t* find_fat_volume(const char* path, int len)
 }
 
 //------------------------------------------------------------------------------
-static int sync_win(fat_t* fat)
+static uint32_t sect_to_clust(Fat* fat, uint32_t sect)
 {
-  if (fat->win_dirty)
+  return ((sect - fat->data_sect) >> fat->clust_shift) + 2;
+}
+
+//------------------------------------------------------------------------------
+static uint32_t clust_to_sect(Fat* fat, uint32_t clust)
+{
+  return ((clust - 2) << fat->clust_shift) + fat->data_sect;
+}
+
+//------------------------------------------------------------------------------
+static int sync_buf(Fat* fat)
+{
+  if (fat->flags & FAT_BUF_DIRTY)
   {
-    if (!fat->ops.write(fat->win, fat->win_sect))
-      return FAT_ERR_DISK;
+    if (!fat->ops.write(fat->buf, fat->sect))
+      return FAT_ERR_IO;
 
-    fat->win_dirty = false;
+    fat->flags &= ~FAT_BUF_DIRTY;
   }
-
   return FAT_ERR_NONE;
 }
 
 //------------------------------------------------------------------------------
-static int move_win(fat_t* fat, uint32_t sect)
+static int update_buf(Fat* fat, uint32_t sect)
 {
-  if (sect != fat->win_sect)
+  if (fat->sect != sect)
   {
-    int err = sync_win(fat);
+    int err = sync_buf(fat);
     if (err)
       return err;
     
-    if (!fat->ops.read(fat->win, sect))
-      return FAT_ERR_DISK;
+    if (!fat->ops.read(fat->buf, sect))
+      return FAT_ERR_IO;
 
-    fat->win_sect = sect;
+    fat->sect = sect;
   }
 
   return FAT_ERR_NONE;
 }
 
 //------------------------------------------------------------------------------
-static int sync_buf(fat_t* fat, file_t* file)
+static int sync_fs(Fat* fat)
 {
-  if (file->buf_dirty)
-  {
-    if (!fat->ops.write(file->buf, file->buf_sect))
-      return FAT_ERR_DISK;
-
-    file->buf_dirty = false;
-  }
-
-  return FAT_ERR_NONE;
-}
-
-//------------------------------------------------------------------------------
-static int move_buf(fat_t* fat, file_t* file, uint32_t sect)
-{
-  if (sect != file->buf_sect)
-  {
-    int err = sync_win(fat);
-    if (err)
-      return err;
-    
-    if (!fat->ops.read(file->buf, sect))
-      return FAT_ERR_DISK;
-
-    file->buf_sect = sect;
-  }
-
-  return FAT_ERR_NONE;
-}
-
-//------------------------------------------------------------------------------
-static int sync_fat(fat_t* fat)
-{
-  int err = sync_win(fat);
+  int err = sync_buf(fat);
   if (err)
     return err;
 
-  if (fat->info_dirty)
+  if (fat->flags & FAT_INFO_DIRTY)
   {
-    err = move_win(fat, fat->info_sect);
-    if (err)
-      return err;
-    
-    fsinfo_t* info = (fsinfo_t*)fat->win;
-    fat->win_dirty = true;
-
-    memset(info, 0, sizeof(fsinfo_t));
-    info->head_sig = FSINFO_HEAD_SIG;
-    info->tail_sig = FSINFO_TAIL_SIG;
-    info->struct_sig = FSINFO_STRUCT_SIG;
-    info->next_free = fat->info_last;
-    info->free_cnt = fat->info_cnt;
-
-    err = sync_win(fat);
+    err = update_buf(fat, fat->info_sect);
     if (err)
       return err;
 
-    fat->info_dirty = false;
+    FsInfo* info = (FsInfo*)fat->buf;
+    fat->flags |= FAT_BUF_DIRTY;
+    info->next_free = fat->last_used;
+    info->free_cnt = fat->free_cnt;
+
+    err = sync_buf(fat);
+    if (err)
+      return err;
+
+    fat->flags &= ~FAT_INFO_DIRTY;
   }
 
   return FAT_ERR_NONE;
 }
 
 //------------------------------------------------------------------------------
-static uint32_t sect_to_clust(fat_t* fat, uint32_t sect)
+static int get_fat(Fat* fat, uint32_t clust, uint32_t* out_val, uint8_t* out_flags)
 {
-  return ((sect - fat->data_sect) / fat->sect_per_clust) + 2;
-}
+  uint32_t* items = (uint32_t*)fat->buf;
+  uint32_t sect = fat->fat_sect[0] + clust / 128; // Active FAT
+  uint32_t idx = clust % 128;
 
-//------------------------------------------------------------------------------
-static uint32_t clust_to_sect(fat_t* fat, uint32_t clust)
-{
-  return ((clust - 2) * fat->sect_per_clust) + fat->data_sect;
-}
-
-//------------------------------------------------------------------------------
-static int get_fat(fat_t* fat, uint32_t clust, uint32_t* res)
-{
-  // Assume first FAT is correct
-  uint32_t sect = fat->fat_sect[0] + clust / 128;
-  uint32_t off = (clust % 128) << 2;
-
-  int err = move_win(fat, sect);
+  int err = update_buf(fat, sect);
   if (err)
     return err;
 
-  uint32_t* ent = (uint32_t*)(fat->win + off);
-  *res = *ent & 0x0fffffff;
+  // Upper nibble is ignored
+  uint32_t val = items[idx] & 0x0fffffff;
+  uint8_t flags;
+
+  if (val == 0)
+    flags = CLUST_FREE;
+  else if (val == 0x0ffffff7)
+    flags = CLUST_BAD;
+  else if (val >= 0x0ffffff8)
+    flags = CLUST_USED | CLUST_LAST;
+  else if (val >= 2 && val < fat->clust_cnt)
+    flags = CLUST_USED;
+  else
+    return FAT_ERR_BROKEN;
+
+  *out_val = val;
+  *out_flags = flags;
 
   return FAT_ERR_NONE;
 }
 
 //------------------------------------------------------------------------------
-static int put_fat_in(fat_t* fat, int idx, uint32_t clust, uint32_t val)
+static int put_fat2(Fat* fat, uint32_t fat_sect, uint32_t clust, uint32_t val)
 {
-  uint32_t sect = fat->fat_sect[idx] + clust / 128;
-  uint32_t off = 4 * (clust % 128);
+  uint32_t* items = (uint32_t*)fat->buf;
+  uint32_t sect = fat_sect + clust / 128;
+  uint16_t idx = clust % 128;
 
-  int err = move_win(fat, sect);
+  int err = update_buf(fat, sect);
   if (err)
     return err;
 
   // Upper nibble must be preserved
-  uint32_t* ent = (uint32_t*)(fat->win + off);
-  *ent = (*ent & 0xf0000000) | (val & 0x0fffffff);
-  fat->win_dirty = true;
+  items[idx] = (items[idx] & 0xf0000000) | (val & 0x0fffffff);
+  fat->flags |= FAT_BUF_DIRTY;
 
   return FAT_ERR_NONE;
 }
 
 //------------------------------------------------------------------------------
-static int put_fat(fat_t* fat, uint32_t clust, uint32_t val)
+static int put_fat(Fat* fat, uint32_t clust, uint32_t val)
 {
-  int err = put_fat_in(fat, 0, clust, val);
-  if (err)
-    return err;
-  
-  return put_fat_in(fat, 1, clust, val);
-}
-
-//------------------------------------------------------------------------------
-static int get_clust_status(fat_t* fat, uint32_t clust)
-{
-  if (clust == 0)
-    return CLUST_FREE;
-
-  if (clust == 0x0fffffff)
-    return CLUST_USED | CLUST_LAST;
-
-  if (clust >= 0x0ffffff6 || clust >= fat->clust_cnt)
-    return CLUST_BAD;
-
-  return CLUST_USED;
-}
-
-//------------------------------------------------------------------------------
-static int clust_clear(fat_t* fat, uint32_t clust)
-{
-  uint32_t sect = clust_to_sect(fat, clust);
-
-  for (int i = 0; i < fat->sect_per_clust; i++)
+  if (fat->fat_sect[1]) // Mirroring enabled
   {
-    int err = sync_win(fat);
+    int err = put_fat2(fat, fat->fat_sect[1], clust, val);
     if (err)
       return err;
-
-    memset(fat->win, 0, SECT_SIZE);
-    fat->win_sect = sect++;
-    fat->win_dirty = true;
   }
 
-  return FAT_ERR_NONE;
+  return put_fat2(fat, fat->fat_sect[0], clust, val);
 }
 
 //------------------------------------------------------------------------------
-static int clust_chain_remove(fat_t* fat, uint32_t clust)
+static int remove_chain(Fat* fat, uint32_t clust)
 {
+  uint8_t flags;
+  uint32_t next;
+
+  fat->flags |= FAT_INFO_DIRTY;
+
   for (;;)
   {
-    uint32_t next;
-    int err = get_fat(fat, clust, &next);
+    int err = get_fat(fat, clust, &next, &flags);
     if (err)
       return err;
-    
-    int status = get_clust_status(fat, next);
 
-    if (status & (CLUST_BAD | CLUST_FREE))
+    if (flags & (CLUST_BAD | CLUST_FREE))
       return FAT_ERR_BROKEN;
-    
+
     err = put_fat(fat, clust, 0);
     if (err)
       return err;
-    
-    fat->info_cnt++;
+
+    fat->free_cnt++;
     clust = next;
 
-    if (status & CLUST_LAST)
+    if (flags & CLUST_LAST)
       break;
   }
 
-  fat->info_dirty = true;
-  return sync_fat(fat);
+  return sync_fs(fat);
 }
 
 //------------------------------------------------------------------------------
-static int clust_chain_stretch(fat_t* fat, uint32_t clust, uint32_t* new)
+static int stretch_chain(Fat* fat, uint32_t clust, uint32_t* out_clust)
 {
-  int err, status;
-  uint32_t it, next;
+  int err;
+  uint8_t flags;
+  uint32_t next;
+  uint32_t prev = clust;
   bool scan = true;
 
-  if (clust)
+  fat->flags |= FAT_INFO_DIRTY;
+
+  if (prev)
   {
-    // Stretch cluster chain. Check next cluster; if not free, scan from last used.
-    it = clust + 1;
-    if (it >= fat->clust_cnt)
-      it = 2;
-    
-    err = get_fat(fat, it, &next);
+    // Stretching. Check next cluster.
+    if (++clust >= fat->clust_cnt)
+      clust = 2;
+
+    err = get_fat(fat, clust, &next, &flags);
     if (err)
       return err;
-    
-    status = get_clust_status(fat, next);
 
-    if (status & CLUST_FREE)
+    if (flags & CLUST_FREE)
       scan = false;
   }
 
   if (scan)
   {
-    uint32_t mark = fat->info_last;
-    it = fat->info_last;
+    clust = fat->last_used;
 
     for (;;)
     {
-      if (++it == mark)
+      if (++clust >= fat->clust_cnt)
+        clust = 2;
+
+      if (clust == fat->last_used)
         return FAT_ERR_FULL;
 
-      if (it >= fat->clust_cnt)
-        it = 2;
-
-      err = get_fat(fat, it, &next);
+      err = get_fat(fat, clust, &next, &flags);
       if (err)
-        return err;
-      
-      status = get_clust_status(fat, next);
+        return flags;
 
-      if (status & CLUST_FREE)
+      if (flags & CLUST_FREE)
         break;
     }
   }
 
-  // Mark end of cluster chain
-  err = put_fat(fat, it, 0x0fffffff);
+  err = put_fat(fat, clust, 0x0fffffff); // EOC
   if (err)
     return err;
-  
-  if (clust)
+
+  if (prev)
   {
     // Stretching. Add link.
-    err = put_fat(fat, clust, it);
+    err = put_fat(fat, prev, clust);
     if (err)
       return err;
   }
 
-  fat->info_last = it;
-  fat->info_cnt--;
-  fat->info_dirty = true;
+  fat->last_used = clust;
+  fat->free_cnt--;
 
-  *new = it;
-  return sync_fat(fat);
+  *out_clust = clust;
+  return sync_fs(fat);
 }
 
 //------------------------------------------------------------------------------
-static int clust_chain_create(fat_t* fat, uint32_t* new)
+static int create_chain(Fat* fat, uint32_t* out_clust)
 {
-  return clust_chain_stretch(fat, 0, new);
+  return stretch_chain(fat, 0, out_clust);
 }
 
 //------------------------------------------------------------------------------
-static void dir_rewind(fat_t* fat, dir_t* dir)
+static int clust_clear(Fat* fat, uint32_t clust)
 {
-  dir->clust = dir->first_clust;
-  dir->sect = clust_to_sect(fat, dir->first_clust);
+  int err = sync_buf(fat);
+  if (err)
+    return err;
+  
+  uint32_t sect = clust_to_sect(fat, clust);
+  memset(fat->buf, 0, 512);
+
+  for (int i = 0; i < (1 << fat->clust_shift); i++)
+  {
+    fat->flags |= FAT_BUF_DIRTY;
+    fat->sect = sect++;
+
+    err = sync_buf(fat);
+    if (err)
+      return err;
+  }
+
+  return FAT_ERR_NONE;
+}
+
+//------------------------------------------------------------------------------
+static void dir_at_clust(Dir* dir, uint32_t clust)
+{
+  dir->clust = clust;
+  dir->sect = clust_to_sect(dir->fat, clust);
   dir->idx = 0;
 }
 
 //------------------------------------------------------------------------------
-static int dir_next(fat_t* fat, dir_t* dir)
+static void dir_enter(Dir* dir, uint32_t clust)
 {
-  dir->idx += sizeof(dir_ent_t);
+  // Cluster is zero for .. entries pointing to root
+  if (clust == 0)
+    clust = dir->fat->root_clust;
 
-  if (dir->idx < SECT_SIZE)
+  dir->sclust = clust;
+  dir_at_clust(dir, clust);
+}
+
+//------------------------------------------------------------------------------
+static int dir_next(Dir* dir)
+{
+  dir->idx += sizeof(Sfn);
+
+  if (dir->idx < 512)
     return FAT_ERR_NONE;
 
   dir->idx = 0;
   dir->sect++;
 
-  if (0 == (dir->sect % fat->sect_per_clust))
-  {
-    uint32_t next;
-    int err = get_fat(fat, dir->clust, &next);
-    if (err)
-      return err;
-    
-    int status = get_clust_status(fat, next);
-    
-    if (status & (CLUST_BAD | CLUST_FREE))
-      return FAT_ERR_BROKEN;
+  if (dir->sect & dir->fat->clust_msk) // Still in same cluster
+    return FAT_ERR_NONE;
 
-    if (status & CLUST_LAST)
-      return FAT_ERR_EOF;
-    
-    dir->clust = next;
-    dir->sect = clust_to_sect(fat, next);
-  }
+  uint8_t flags;
+  uint32_t next;
 
+  int err = get_fat(dir->fat, dir->clust, &next, &flags);
+  if (err)
+    return err;
+
+  if (flags & (CLUST_BAD | CLUST_FREE))
+    return FAT_ERR_BROKEN;
+  
+  if (flags & CLUST_LAST) // EOC
+    return FAT_ERR_EOF;
+
+  dir_at_clust(dir, next);
   return FAT_ERR_NONE;
 }
 
 //------------------------------------------------------------------------------
-static int dir_next_stretch(fat_t* fat, dir_t* dir)
+static int dir_advance(Dir* dir, int cnt)
 {
-  int err = dir_next(fat, dir);
+  for (int i = 0; i < cnt; i++)
+  {
+    int err = dir_next(dir);
+    if (err)
+      return err;
+  }
+  return FAT_ERR_NONE;
+}
+
+//------------------------------------------------------------------------------
+static int dir_next_stretch(Dir* dir)
+{
+  int err = dir_next(dir);
   if (err != FAT_ERR_EOF)
     return err;
 
   uint32_t next;
-  err = clust_chain_stretch(fat, dir->clust, &next);
+  err = stretch_chain(dir->fat, dir->clust, &next);
   if (err)
     return err;
 
-  err = clust_clear(fat, next);
-  if (err)
-    return err;
-  
-  dir->clust = next;
-  dir->sect = clust_to_sect(fat, next);
-  dir->idx = 0;
-
-  return FAT_ERR_NONE;
+  dir_at_clust(dir, next);
+  return clust_clear(dir->fat, dir->clust);
 }
 
 //------------------------------------------------------------------------------
-static bool dir_ent_is_last(dir_ent_t* ent)
+static void* dir_ptr(Dir* dir)
 {
-  return ent->name[0] == SFN_LAST;
+  return dir->fat->buf + dir->idx;
 }
 
 //------------------------------------------------------------------------------
-static bool dir_ent_is_free(dir_ent_t* ent)
+static bool sfn_is_last(Sfn* sfn)
 {
-  return ent->name[0] == SFN_LAST || ent->name[0] == SFN_FREE;
+  return sfn->name[0] == SFN_LAST;
 }
 
 //------------------------------------------------------------------------------
-static bool dir_ent_is_lfn(dir_ent_t* ent)
+static bool sfn_is_free(Sfn* sfn)
 {
-  return ent->attr == FAT_ATTR_LFN;
+  return sfn->name[0] == SFN_LAST || sfn->name[0] == SFN_FREE;
 }
 
 //------------------------------------------------------------------------------
+static bool sfn_is_lfn(Sfn* sfn)
+{
+  return sfn->attr == FAT_ATTR_LFN;
+}
+
+//------------------------------------------------------------------------------
+static uint32_t sfn_cluster(Sfn* sfn)
+{
+  return sfn->clust_hi << 16 | sfn->clust_lo;
+}
+
+//------------------------------------------------------------------------------
+// Only certain characters are allowed in an SFN file name. Invalid characters 
+// are converted to underscore. It does not follow Windows' algorithm, using
+// ~N for duplicate names, since it relies on LFN names only.
+
 static char sfn_char(char c)
 {
+  const char* str = "!#$%&'()-@^_`{}~ "; // Allowed special characters
+
   c = to_upper(c);
   if (c >= 'A' && c <= 'Z')
     return c;
   
-  const char specials[] = "!#$%&'()-@^_`{}~";
-  for (int i = 0; i < sizeof(specials) - 1; i++)
+  for (int i = 0; str[i]; i++)
   {
-    if (c == specials[i])
+    if (c == str[i])
       return c;
   }
 
-  return '~';
+  return '_';
 }
 
 //------------------------------------------------------------------------------
@@ -845,7 +637,7 @@ static void put_sfn_name(uint8_t* sfn_name, const char* name, int len)
     sfn_name[i] = sfn_char(name[i]);
 
   for (j = i; j < 8; j++)
-    sfn_name[j] = ' ';
+    sfn_name[j] = SFN_PAD;
 
   while (i < len && name[i++] != '.');
 
@@ -853,254 +645,271 @@ static void put_sfn_name(uint8_t* sfn_name, const char* name, int len)
     sfn_name[8 + j] = sfn_char(name[i]);
 
   for (; j < 3; j++)
-    sfn_name[8 + j] = ' ';
+    sfn_name[8 + j] = SFN_PAD;
 }
 
 //------------------------------------------------------------------------------
-static void load_sfn_name(fat_t* fat, dir_ent_t* ent)
+static void parse_sfn_name(uint8_t* sfn_name)
 {
-  uint8_t* ptr = fat->name;
+  uint8_t* ptr = g_buf;
 
-  for (int i = 0; i < 8 && ent->name[i] != ' '; i++)
-    *ptr++ = ent->name[i];
+  for (int i = 0; i < 8 && sfn_name[i] != SFN_PAD; i++)
+    *ptr++ = sfn_name[i];
 
-  if (ent->name[8] != ' ')
+  if (sfn_name[8] != SFN_PAD)
     *ptr++ = '.';
 
-  for (int i = 8; i < 11 && ent->name[i] != ' '; i++)
-    *ptr++ = ent->name[i];
+  for (int i = 8; i < 11 && sfn_name[i] != SFN_PAD; i++)
+    *ptr++ = sfn_name[i];
 
-  fat->namelen = ptr - fat->name;
+  g_len = ptr - g_buf;
 }
 
 //------------------------------------------------------------------------------
-static void put_lfn_name(lfn_ent_t* ent, const char* name, int len)
+static void put_lfn_name_frag(Lfn* lfn, const char* name, int len)
 {
-  uint8_t* ptr = (uint8_t*)ent;
-
   int i;
   for (i = 0; i < len; i++)
   {
-    ptr[g_lfn_pos[i] + 0] = name[i];
-    ptr[g_lfn_pos[i] + 1] = 0x00;
+    lfn->raw[g_lfn_indices[i] + 0] = name[i];
+    lfn->raw[g_lfn_indices[i] + 1] = 0x00;
   }
   
   if (i < 13)
   {
-    ptr[g_lfn_pos[i] + 0] = 0x00;
-    ptr[g_lfn_pos[i] + 1] = 0x00;
+    lfn->raw[g_lfn_indices[i] + 0] = 0x00;
+    lfn->raw[g_lfn_indices[i] + 1] = 0x00;
 
     while (++i < 13)
     {
-      ptr[g_lfn_pos[i] + 0] = 0xff;
-      ptr[g_lfn_pos[i] + 1] = 0xff;
+      lfn->raw[g_lfn_indices[i] + 0] = 0xff;
+      lfn->raw[g_lfn_indices[i] + 1] = 0xff;
     }
   }
 }
 
 //------------------------------------------------------------------------------
-// The LFN entry spans multiple entries, and possible clusters. This moves the 
-// directory pointer, and loads one LFN name into the FAT name buffer.
-
-static int load_lfn_name(fat_t* fat, dir_t* dir)
+static int parse_lfn_name(Dir* dir)
 {
-  int err = move_win(fat, dir->sect);
-  if (err)
-    return err;
+  int err = update_buf(dir->fat, dir->sect);
+  if (err) return err;
+  
+  Lfn* lfn = dir_ptr(dir);
+  g_crc = lfn->crc;
+  g_len = 0;
 
-  lfn_ent_t* ent = (lfn_ent_t*)(fat->win + dir->idx);
-
-  fat->crc = ent->crc;
-  fat->namelen = 0;
-
-  if (0 == (ent->seq & LFN_FIRST))
+  if (0 == (lfn->seq & LFN_HEAD_MSK))
     return FAT_ERR_BROKEN;
 
-  int cnt = ent->seq & LFN_SEQ_MASK;
+  int cnt = lfn->seq & LFN_SEQ_MSK;
   if (cnt > 20)
     return FAT_ERR_BROKEN;
 
   while (cnt--)
   {
-    if (ent->attr != FAT_ATTR_LFN || ent->crc != fat->crc)
+    if (lfn->attr != FAT_ATTR_LFN || lfn->crc != g_crc)
       return FAT_ERR_BROKEN;
 
-    int i;
-    for (i = 0; i < 13; i++)
+    for (int i = 0; i < 13; i++)
     {
-      char c = fat->win[dir->idx + g_lfn_pos[i]];
+      char c = lfn->raw[g_lfn_indices[i]];
 
       if (c == 0xff)
-        return FAT_ERR_BROKEN; // Must proceed termination
+        return FAT_ERR_BROKEN; // 0x00 must be first
 
       if (c == 0x00)
         break;
 
-      fat->name[13 * cnt + i] = c;
+      g_buf[13 * cnt + i] = c;
+      g_len++;
     }
 
-    fat->namelen += i;
-
-    err = dir_next(fat, dir);
+    err = dir_next(dir);
     if (err)
       return err;
+
+    err = update_buf(dir->fat, dir->sect);
+    if (err)
+      return err;
+
+    lfn = dir_ptr(dir);
   }
 
-  return fat->namelen <= 255 ? FAT_ERR_NONE : FAT_ERR_BROKEN;
+  return g_len <= 255 ? FAT_ERR_NONE : FAT_ERR_BROKEN;
 }
 
 //------------------------------------------------------------------------------
-static int dir_search(fat_t* fat, dir_t* dir, const char* name, int len, dir_t* start)
+static int dir_search(Dir* dir, const char* name, int len, Loc* loc)
 {
-  dir_rewind(fat, dir);
+  // Should it support matching SFN?
+  uint8_t sfn_name[11];
+  put_sfn_name(sfn_name, name, len);
 
-  for (;;)
+  dir_at_clust(dir, dir->sclust);
+
+  for (int err = 0;; err = dir_next(dir))
   {
-    int err = move_win(fat, dir->sect);
     if (err)
       return err;
-    
-    dir_ent_t* ent = (dir_ent_t*)(fat->win + dir->idx);
-    
-    if (dir_ent_is_last(ent))
+
+    err = update_buf(dir->fat, dir->sect);
+    if (err)
+      return err;
+
+    Sfn* sfn = dir_ptr(dir);
+
+    if (sfn_is_last(sfn))
       return FAT_ERR_EOF;
+    
+    if (sfn_is_free(sfn))
+      continue;
 
-    if (!dir_ent_is_free(ent))
+    if (loc)
     {
-      if (start)
-      {
-        start->sect = dir->sect;
-        start->idx = dir->idx;
-      }
-
-      if (dir_ent_is_lfn(ent))
-      {
-
-        err = load_lfn_name(fat, dir);
-        if (err)
-          return err;
-
-        // The following entry must be SFN
-        err = move_win(fat, dir->sect);
-        if (err)
-          return err;
-        
-        ent = (dir_ent_t*)(fat->win + dir->idx);
-
-        if (dir_ent_is_free(ent) || dir_ent_is_lfn(ent))
-          return FAT_ERR_BROKEN;
-
-        if (fat->crc != calc_crc(ent->name))
-          return FAT_ERR_BROKEN;
-        
-        if ((fat->namelen == len) && (0 == memcmp(fat->name, name, len)))
-          return FAT_ERR_NONE;
-      }
-      else
-      {
-        load_sfn_name(fat, ent);
-        if ((fat->namelen == len) && (0 == memcmp_upper((char*)fat->name, name, len)))
-          return FAT_ERR_NONE;
-      }
+      // Update the start location (SFN or first LFN). Used when removing entries.
+      loc->sect = dir->sect;
+      loc->idx = dir->idx;
     }
 
-    err = dir_next(fat, dir);
-    if (err)
-      return err;
+    if (sfn_is_lfn(sfn))
+    {
+      err = parse_lfn_name(dir);
+      if (err)
+        return err;
+
+      sfn = dir_ptr(dir);
+
+      if (sfn_is_free(sfn) || sfn_is_lfn(sfn) || g_crc != get_crc(sfn->name))
+        return FAT_ERR_BROKEN;
+
+      if (g_len == len && !memcmp(g_buf, name, len))
+        return FAT_ERR_NONE;
+    }
+    else
+    {
+      if (!memcmp(sfn_name, sfn->name, sizeof(sfn_name)))
+        return FAT_ERR_NONE;
+    }
   }
 }
 
 //------------------------------------------------------------------------------
-static int follow_path(dir_t* dir, const char** path)
+static bool dir_at_root(Dir* dir)
+{
+  return dir->clust == dir->fat->root_clust &&
+    dir->sect == clust_to_sect(dir->fat, dir->fat->root_clust) && 
+    dir->idx == 0;
+}
+
+//------------------------------------------------------------------------------
+static int follow_path(Dir* dir, const char** path, Loc* loc)
 {
   int err, len;
+  uint32_t dir_clust;
+  bool dir_enterable;
   const char* str = *path;
 
-  if (*str == '/')
-  {
-    str++;
-    len = subpath_len(str);
-    if (len == 0)
-      return FAT_ERR_PATH;
-    
-    fat_t* fat = find_fat_volume(str, len);
-    if (!fat)
-      return FAT_ERR_PATH;
-    
-    str += len;
+  if (*str++ != '/')
+    return FAT_ERR_PATH;
+  len = subpath_len(str);
+  if (len == 0)
+    return FAT_ERR_PATH;
 
-    dir->fat = fat;
-    dir->first_clust = sect_to_clust(fat, fat->root_sect);
-    dir->clust = dir->first_clust;
-    dir->sect = fat->root_sect;
-    dir->idx = 0;
-  }
+  dir->fat = find_fat_volume(str, len);
+  if (!dir->fat)
+    return FAT_ERR_PATH;
 
-  fat_t* fat = dir->fat;
-  if (!fat)
-    return FAT_ERR_PARAM;
+  // Enter root by default (no entry points to it)
+  dir_enter(dir, dir->fat->root_clust);
+  dir_clust = dir->clust;
+  dir_enterable = true;
 
-  dir_rewind(fat, dir);
+  str += len;
+  *path = str;
 
   for (;;)
   {
-    if (*str == '/')
-    {
+    while (*str == '/')
       str++;
-      *path = str;
-    }
+    *path = str;
 
     len = subpath_len(str);
     if (len == 0)
-      return FAT_ERR_NONE;
+      return FAT_ERR_NONE; // Do not enter directory. Dir points to the SFN of path.
 
-    err = dir_search(fat, dir, str, len, NULL);
+    if (!dir_enterable)
+      return FAT_ERR_PATH;
+
+    dir_enter(dir, dir_clust);
+
+    err = dir_search(dir, str, len, loc);
     if (err)
       return err;
-      
-    dir_ent_t* ent = (dir_ent_t*)(fat->win + dir->idx);
 
-    if (0 == (ent->attr & FAT_ATTR_DIR))
-      return FAT_ERR_NONE;
-    
     str += len;
     *path = str;
 
-    uint32_t clust = ent->clust_hi << 16 | ent->clust_lo;
-    if (clust == 0)
-      clust = 2;
-
-    dir->first_clust = clust;
-    dir->clust = clust;
-    dir->sect = clust_to_sect(fat, clust);
-    dir->idx = 0;
+    Sfn* sfn = dir_ptr(dir);
+    dir_clust = sfn_cluster(sfn);
+    dir_enterable = (sfn->attr & FAT_ATTR_DIR) != 0;
   }
 }
 
 //------------------------------------------------------------------------------
-static int dir_register(fat_t* fat, dir_t* dir, const char* name, int len, uint8_t attr, uint32_t clust)
+static int remove_entries(Dir* dir, Loc* loc)
+{
+  // Save dir location (last entry to delete)
+  uint32_t sect = dir->sect;
+  uint16_t idx = dir->idx;
+
+  // Rewind dir to loc (first entry to delete)
+  dir->clust = sect_to_clust(dir->fat, loc->sect);
+  dir->sect = loc->sect;
+  dir->idx = loc->idx;
+
+  for (;;)
+  {
+    int err = update_buf(dir->fat, dir->sect);
+    if (err)
+      return err;
+
+    Sfn* sfn = dir_ptr(dir);
+    sfn->name[0] = SFN_FREE;
+    dir->fat->flags |= FAT_BUF_DIRTY;
+
+    if (dir->sect == sect && dir->idx == idx)
+      return FAT_ERR_NONE;
+
+    err = dir_next(dir);
+    if (err)
+      return err;
+  }
+}
+
+//------------------------------------------------------------------------------
+static int dir_add(Dir* dir, const char* name, int len, uint8_t attr, uint32_t clust)
 {
   if (len <= 0 || len > 255)
     return FAT_ERR_PARAM;
 
-  int err, idx;
-  uint32_t sect;
+  int err;
   bool eod = false;
+  uint16_t idx = 0;
+  uint32_t sect = 0;
   int lfns = (len + 12) / 13;
 
-  dir_rewind(fat, dir);
+  dir_enter(dir, dir->sclust);
 
   // Try to find lfn_cnt + 1 consecutive free entries. Stretch cluster chain
-  // if necessary. Store the first free entry in the sequence.
+  // if necessary. Store location of first entry in the sequence.
   for (int cnt = 0; cnt < lfns + 1;)
   {
-    err = move_win(fat, dir->sect);
+    err = update_buf(dir->fat, dir->sect);
     if (err)
       return err;
 
-    dir_ent_t* ent = (dir_ent_t*)(fat->win + dir->idx);
-
-    if (eod || dir_ent_is_free(ent))
+    Sfn* sfn = dir_ptr(dir);
+    if (eod || sfn_is_free(sfn))
     {
       if (cnt++ == 0)
       {
@@ -1111,164 +920,206 @@ static int dir_register(fat_t* fat, dir_t* dir, const char* name, int len, uint8
     else
       cnt = 0;
 
-    if (dir_ent_is_last(ent))
+    if (sfn_is_last(sfn))
       eod = true;
 
-    err = dir_next_stretch(fat, dir);
+    err = dir_next_stretch(dir);
     if (err)
       return err;
   }
 
   if (eod)
   {
-    // We are currently at the entry after the future SFN.
-    // Create new EOD marker
-    err = move_win(fat, dir->sect);
+    // We are currently at the entry after the SFN we will create.
+    // Since it hit EOD the entry is free. Create new EOD.
+    err = update_buf(dir->fat, dir->sect);
     if (err)
       return err;
     
-    dir_ent_t* ent = (dir_ent_t*)(fat->win + dir->idx);
-
-    if (!dir_ent_is_free(ent))
-      return FAT_ERR_BROKEN;
-
-    ent->name[0] = 0x00;
-    fat->win_dirty = true;
+    Sfn* sfn = dir_ptr(dir);
+    sfn->name[0] = 0x00;
+    dir->fat->flags |= FAT_BUF_DIRTY;
   }
 
   // Rewind to the first free entry
-  dir->clust = sect_to_clust(fat, sect);
+  dir->clust = sect_to_clust(dir->fat, sect);
   dir->sect = sect;
   dir->idx = idx;
 
   uint8_t sfn_name[11];
   put_sfn_name(sfn_name, name, len);
 
-  uint8_t crc = calc_crc(sfn_name);
-  uint8_t mask = LFN_FIRST;
+  uint8_t crc = get_crc(sfn_name);
+  uint8_t mask = LFN_HEAD_MSK;
 
+  // Create LFN entries
   for (int i = lfns; i > 0; i--, mask = 0)
   {
-    err = move_win(fat, dir->sect);
+    err = update_buf(dir->fat, dir->sect);
     if (err)
       return err;
     
-    lfn_ent_t* lfn = (lfn_ent_t*)(fat->win + dir->idx);
-    fat->win_dirty = true;
+    Lfn* lfn = dir_ptr(dir);
+    dir->fat->flags |= FAT_BUF_DIRTY;
 
     int pos = 13 * (i - 1);
-    put_lfn_name(lfn, name + pos, LIMIT(len - pos, 13));
+    put_lfn_name_frag(lfn, name + pos, LIMIT(len - pos, 13));
     lfn->attr = FAT_ATTR_LFN;
     lfn->seq = mask | i;
     lfn->crc = crc;
     lfn->type = 0;
     lfn->clust = 0;
     
-    err = dir_next(fat, dir);
-    if (err && err != FAT_ERR_EOF) // We have not updated yet
+    err = dir_next(dir);
+    if (err)
       return err;
   }
 
   uint16_t time, date;
-  put_timestamp(&date, &time);
+  encode_timestamp(&date, &time);
 
-  err = move_win(fat, dir->sect);
+  err = update_buf(dir->fat, dir->sect);
   if (err)
     return err;
 
-  dir_ent_t* ent = (dir_ent_t*)(fat->win + dir->idx);
-  fat->win_dirty = true;
+  Sfn* sfn = dir_ptr(dir);
+  dir->fat->flags |= FAT_BUF_DIRTY;
 
-  memcpy(ent->name, sfn_name, sizeof(ent->name));
-  ent->clust_hi = clust >> 16;
-  ent->clust_lo = clust & 0xffff;
-  ent->attr = attr;
-  ent->reserved = 0;
-  ent->tenth = 0;
-  ent->create_time = time;
-  ent->modify_time = time;
-  ent->create_date = date;
-  ent->modify_date = date;
-  ent->access_date = date;
-  ent->size = 0;
+  memcpy(sfn->name, sfn_name, sizeof(sfn->name));
+  sfn->clust_hi = clust >> 16;
+  sfn->clust_lo = clust & 0xffff;
+  sfn->attr = attr;
+  sfn->reserved = 0;
+  sfn->tenth = 0;
+  sfn->cre_time = time;
+  sfn->mod_time = time;
+  sfn->cre_date = date;
+  sfn->mod_date = date;
+  sfn->acc_date = date;
+  sfn->size = 0;
 
   return FAT_ERR_NONE;
 }
 
 //------------------------------------------------------------------------------
-static int get_mbr_partition(fat_t* fat, mbr_part_t* part, int part_num)
+static bool get_part_lba(uint8_t* buf, int partition, uint32_t* lba)
 {
-  int err = move_win(fat, 0);
-  if (err)
-    return err;
+  Mbr* mbr = (Mbr*)buf;
 
-  if (fat->win[510] != 0x55 || fat->win[511] != 0xaa)
-    return FAT_ERR_NOFAT;
+  if (mbr->sig != 0xaa55)
+    return false;
 
-  *part = ((mbr_part_t*)(fat->win + 446))[part_num];
-  return FAT_ERR_NONE;
+  if (mbr->part[partition].type != 0x0c) // Must be FAT32
+    return false;
+  
+  *lba = mbr->part[partition].lba;
+  return true;
 }
 
 //------------------------------------------------------------------------------
-int fat_mount(disk_ops_t* ops, int part_num, fat_t* fat, const char* path)
+static bool check_fat(uint8_t* buf)
 {
-  int err;
-  fat->ops = *ops;
-  fat->win_sect = 0xffffffff; // First call to move_win will succeed
-
-  mbr_part_t part;
-  err = get_mbr_partition(fat, &part, part_num);
-  if (err)
-    return err;
-
-  if (part.type != 0xc)
-    return FAT_ERR_NOFAT;
-
-  err = move_win(fat, part.lba);
-  if (err)
-    return err;
-
-  bpb_t* bpb = (bpb_t*)fat->win;
+  Bpb* bpb = (Bpb*)buf;
   
   if (bpb->jump[0] != 0xeb && bpb->jump[0] != 0xe9)
-    return FAT_ERR_NOFAT;
+    return false;
 
+  // Check if we need to be this strict.
   if (bpb->fat_cnt != 2)
-    return FAT_ERR_NOFAT;
+    return false;
   
   if (bpb->root_ent_cnt || bpb->sect_cnt_16 || bpb->sect_per_fat_16)
-    return FAT_ERR_NOFAT;
+    return false;
   
   if (bpb->info_sect != 1)
-    return FAT_ERR_NOFAT;
+    return false;
 
   if (memcmp(bpb->fs_type, "FAT32   ", 8))
-    return FAT_ERR_NOFAT;
+    return false;
     
-  if (bpb->bytes_per_sect != SECT_SIZE)
+  if (bpb->bytes_per_sect != 512)
+    return false;
+  
+  // Only two FAT tables should exist
+  if (!(bpb->ext_flags & EXT_FLAG_MIRROR) && (bpb->ext_flags & EXT_FLAG_ACT) > 1)
+    return false;
+  
+  // FAT type is determined from the count of clusters
+  uint32_t sect_cnt = bpb->sect_cnt_32 - (bpb->res_sect_cnt + bpb->fat_cnt * bpb->sect_per_fat_32);
+  return sect_cnt/ bpb->sect_per_clust >= 65525;
+}
+
+//------------------------------------------------------------------------------
+int probe(DiskOps* ops, int partition, uint32_t* lba)
+{
+  *lba = 0;
+  if (!ops->read(g_buf, *lba))
+    return FAT_ERR_IO;
+
+  if (check_fat(g_buf))
+    return partition == 0 ? FAT_ERR_NONE : FAT_ERR_NOFAT;
+
+  if (!get_part_lba(g_buf, partition, lba))
     return FAT_ERR_NOFAT;
   
-  uint32_t data_cnt = bpb->sect_cnt_32 - (bpb->res_sect_cnt + bpb->fat_cnt * bpb->sect_per_fat_32);
-  uint32_t clust_cnt = data_cnt / bpb->sect_per_clust;
+  if (!ops->read(g_buf, *lba))
+    return FAT_ERR_IO;
+  
+  return check_fat(g_buf) ? FAT_ERR_NONE : FAT_ERR_NOFAT;
+}
 
-  if (clust_cnt < 65525)
-    return FAT_ERR_NOFAT;
+//------------------------------------------------------------------------------
+// Probes a partition on the drive for a FAT32 file system. 
+//
+// Partition 0 returns success when either:
+//  - the entire drive is formatted FAT32
+//  - the drive contain an MBR with partition 0 formatted FAT32
+//
+// Partition 1 to 3 return success when:
+//  - the drive contain an MBR with partition 1 to 3 formatted FAT32
 
-  fat->sect_per_clust = bpb->sect_per_clust;
-  fat->clust_cnt = bpb->sect_per_fat_32 * 128;
-  fat->info_sect = part.lba + bpb->info_sect;
-  fat->fat_sect[0] = part.lba + bpb->res_sect_cnt;
-  fat->fat_sect[1] = fat->fat_sect[0] + bpb->sect_per_fat_32;
-  fat->data_sect = fat->fat_sect[0] + bpb->fat_cnt * bpb->sect_per_fat_32;
-  fat->root_sect = clust_to_sect(fat, bpb->root_cluster);
+int fat_probe(DiskOps* ops, int partition)
+{
+  uint32_t lba;
+  return probe(ops, partition, &lba);
+}
 
-  err = move_win(fat, fat->info_sect);
+//------------------------------------------------------------------------------
+// Mounts a file system. The name specifies which path is used to access it.
+// For example: mounting using 'mnt', and accessing using '/mnt/path/file.txt'.
+// Partition 0 referes to either the entire disk (absense of MBR), or to the 
+// specified MBR partition.
+
+int fat_mount(DiskOps* ops, int partition, Fat* fat, const char* name)
+{
+  uint32_t lba;
+  int err = probe(ops, partition, &lba);
   if (err)
     return err;
 
-  fsinfo_t* info = (fsinfo_t*)fat->win;
+  // Global buffer contains BPB when probe succeeds
+  Bpb* bpb = (Bpb*)g_buf;
 
-  // Require a valid fat info
+  bool mirror    = (bpb->ext_flags & EXT_FLAG_MIRROR) != 0;
+  bool use_first = (bpb->ext_flags & EXT_FLAG_SECOND) == 0;
+
+  uint32_t fat_0 = lba + bpb->res_sect_cnt;
+  uint32_t fat_1 = lba + bpb->res_sect_cnt + bpb->sect_per_fat_32;
+  
+  fat->clust_shift = __builtin_ctz(bpb->sect_per_clust);
+  fat->clust_msk = bpb->sect_per_clust - 1;
+  fat->clust_cnt = bpb->sect_per_fat_32 * 128;
+  fat->root_clust = bpb->root_cluster;
+  fat->fat_sect[0] = use_first ? fat_0 : fat_1;
+  fat->fat_sect[1] = mirror ? (use_first ? fat_1 : fat_0) : 0;
+  fat->info_sect = lba + bpb->info_sect;
+  fat->data_sect = lba + bpb->res_sect_cnt + bpb->fat_cnt * bpb->sect_per_fat_32;
+
+  // Load FsInfo
+  if (!ops->read(g_buf, fat->info_sect))
+    return FAT_ERR_IO;
+
+  FsInfo* info = (FsInfo*)g_buf;
   if (info->tail_sig != FSINFO_TAIL_SIG || 
       info->head_sig != FSINFO_HEAD_SIG ||
       info->struct_sig != FSINFO_STRUCT_SIG ||
@@ -1276,14 +1127,17 @@ int fat_mount(disk_ops_t* ops, int part_num, fat_t* fat, const char* path)
       info->free_cnt == 0xffffffff)
     return FAT_ERR_NOFAT;
   
-  fat->info_last = info->next_free;
-  fat->info_cnt  = info->free_cnt;
+  fat->last_used = info->next_free;
+  fat->free_cnt  = info->free_cnt;
 
-  int path_len = strlen(path);
-  if (sizeof(fat->path) < path_len)
+  int name_len = strlen(name);
+  if (name_len > sizeof(fat->name))
     return FAT_ERR_PARAM;
-  memcpy(fat->path, path, path_len);
-  fat->pathlen = path_len;
+  memcpy(fat->name, name, name_len);
+  fat->name_len = name_len;
+
+  fat->ops = *ops;
+  fat->sect = 0;   // Causes buffering on first call
 
   fat->next = g_fat_list;
   g_fat_list = fat;
@@ -1292,9 +1146,12 @@ int fat_mount(disk_ops_t* ops, int part_num, fat_t* fat, const char* path)
 }
 
 //------------------------------------------------------------------------------
-int fat_umount(fat_t* fat)
+// Syncronizes unwritten changes and removes the fat from the global list. All
+// file must be closed before calling this.
+
+int fat_umount(Fat* fat)
 {
-  fat_t** it = &g_fat_list;
+  Fat** it = &g_fat_list;
   while (*it && *it != fat)
     it = &(*it)->next;
 
@@ -1302,280 +1159,310 @@ int fat_umount(fat_t* fat)
     return FAT_ERR_PARAM;
 
   *it = fat->next;
-
-  return sync_fat(fat);
+  return sync_fs(fat);
 }
 
 //------------------------------------------------------------------------------
-int fat_fopen(file_t* file, const char* path, const char* mode)
+// Synchronizes unwritten changes. Does not synchronize open files.
+
+int fat_sync(Fat* fat)
 {
-  enum
-  {
-    FLAG_W = 0x01,
-    FLAG_R = 0x02,
-    FLAG_A = 0x04,
-    FLAG_X = 0x08,
-    FLAG_P = 0x10,
-  };
-
-  uint8_t flags = 0;
-  while (*mode)
-  {
-    switch (*mode++)
-    {
-      case 'r':
-        flags |= FLAG_R;
-        break;
-      case 'w':
-        flags |= FLAG_W;
-        break;
-      case 'a':
-        flags |= FLAG_A;
-        break;
-      case '+':
-        flags |= FLAG_P;
-        break;
-      case 'x':
-        flags |= FLAG_X;
-        break;
-    }
-  }
-
-  memset(file, 0, sizeof(file_t));
-
-  if (flags & (FLAG_R | FLAG_P))
-    file->read = true;
-
-  if (flags & (FLAG_W | FLAG_A | FLAG_P))
-    file->write = true;
-  
-  bool append = (flags & FLAG_A) != 0;
-  bool create = (flags & (FLAG_W | FLAG_X)) == FLAG_W;
-  bool trunc = (flags & (FLAG_W | FLAG_A)) == FLAG_W;
-
-  int err = follow_path(&file->dir, &path);
-  if (err && err != FAT_ERR_EOF)
-    return err;
-  
-  dir_t* dir = &file->dir;
-  fat_t* fat = dir->fat;
-  uint32_t file_clust;
-  
-  int len = subpath_len(path);
-  if (len == 0 || path[len])
-    return FAT_ERR_PATH;
-
-  err = dir_search(fat, dir, path, len, NULL);
-
-  if (err == FAT_ERR_EOF)
-  {
-    if (!create)
-      return FAT_ERR_DENIED;
-
-    // Create a new file
-    uint32_t new;
-    err = clust_chain_create(fat, &new);
-    if (err)
-      return err;
-    
-    err = dir_register(fat, dir, path, len, FAT_ATTR_NONE, new);
-    if (err)
-      return err;
-    
-    file_clust = new;
-  }
-  else
-  {
-    if (err)
-      return err;
-
-    dir_ent_t* ent = (dir_ent_t*)(fat->win + dir->idx);
-
-    if (trunc)
-    {
-      file->size = 0;
-      file->modified = true;
-    }
-    else
-      file->size = ent->size;
-
-    file_clust = ent->clust_hi << 16 | ent->clust_lo;
-  }
-
-  file->first_clust = file_clust;
-  file->clust = file_clust;
-  file->sect = clust_to_sect(fat, file_clust);
-  file->off = 0;
-
-  return append ? fat_fseek(file, 0, FAT_SEEK_END) : FAT_ERR_NONE;
+  return sync_fs(fat);
 }
 
 //------------------------------------------------------------------------------
-int fat_fclose(file_t* file)
-{
-  if (file->dir.fat == NULL)
-    return FAT_ERR_PARAM;
+// Get information about a file or directory.
 
-  int err = fat_fsync(file);
+int fat_stat(const char* path, DirInfo* info)
+{
+  Dir dir;
+  Loc loc;
+  int err = follow_path(&dir, &path, &loc);
   if (err)
     return err;
   
-  memset(file, 0, sizeof(file_t));
+  int len = subpath_len(path);
+  if (len)
+    return FAT_ERR_PATH;
+  
+  dir.clust = sect_to_clust(dir.fat, loc.sect);
+  dir.sect = loc.sect;
+  dir.idx = loc.idx;
+
+  return fat_dir_read(&dir, info);
+}
+
+//------------------------------------------------------------------------------
+// Unlinks (deletes) an existing file or empty directory.
+
+int fat_unlink(const char* path)
+{
+  Dir dir;
+  Loc loc;
+  int err = follow_path(&dir, &path, &loc);
+  if (err)
+    return err;
+
+  if (dir_at_root(&dir))
+    return FAT_ERR_DENIED;
+
+  Sfn* sfn = dir_ptr(&dir);
+  uint32_t clust = sfn_cluster(sfn);
+
+  if (sfn->attr & (FAT_ATTR_RO | FAT_ATTR_SYS | FAT_ATTR_LABEL))
+    return FAT_ERR_DENIED;
+
+  if (sfn->attr & FAT_ATTR_DIR)
+  {
+    // Make sure the directory is empty
+    Dir tmp = dir;
+    dir_enter(&tmp, sfn_cluster(sfn));
+
+    err = dir_advance(&tmp, 2); // . and ..
+    if (err)
+      return err;
+    
+    for (;;)
+    {
+      err = update_buf(tmp.fat, tmp.sect);
+      if (err)
+        return err;
+
+      sfn = dir_ptr(&tmp);
+      
+      if (sfn_is_last(sfn))
+        break;
+
+      if (!sfn_is_free(sfn))
+        return FAT_ERR_DENIED;
+
+      err = dir_next(&tmp);
+      if (err)
+        return err;
+    }
+  }
+
+  // Delete clusters
+  err = remove_chain(dir.fat, clust);
+  if (err)
+    return err;
+
+  err = remove_entries(&dir, &loc);
+  if (err)
+    return err;
+
+  return sync_fs(dir.fat);
+}
+
+//------------------------------------------------------------------------------
+// Opens a file. The file structure contain the size and offset that can be read
+// by the user at any point. Any combination of the following flags can be used:
+//
+//  - FAT_WRITE:   open for writing
+//  - FAT_READ:    open for reading
+//  - FAT_APPEND:  place file cursor at the end of the file
+//  - FAT_TRUNC:   truncate the file
+//  - FAT_CREATE:  create file if not existing
+
+int fat_file_open(File* file, const char* path, uint8_t flags)
+{
+  Dir dir;
+  dir.fat = 0;
+
+  int err = follow_path(&dir, &path, NULL);
+  if (err && err != FAT_ERR_EOF)
+    return err;
+  
+  if (err == FAT_ERR_EOF) // File does not exist
+  {
+    if (0 == (flags & FAT_CREATE))
+      return FAT_ERR_DENIED;
+    
+    int len = last_subpath_len(path);
+    if (len == 0)
+      return FAT_ERR_PATH;
+
+    // Create a new file
+    uint32_t clust;
+    err = create_chain(dir.fat, &clust);
+    if (err)
+      return err;
+    
+    err = dir_add(&dir, path, len, FAT_ATTR_ARCHIVE, clust);
+    if (err)
+      return err;
+  }
+
+  Sfn* sfn = dir_ptr(&dir);
+
+  file->fat = dir.fat;
+  file->dir_sect = dir.sect;
+  file->dir_idx = dir.idx;
+  file->sclust = sfn_cluster(sfn);
+  file->clust = file->sclust;
+  file->sect = 0xffffffff;
+  file->offset = 0;
+  file->attr = sfn->attr;
+  file->size = sfn->size;
+  file->flags = flags;
+
+  if (file->size && flags & FAT_TRUNC)
+  {
+    file->size = 0;
+    file->flags |= FAT_MODIFIED;
+  }
+
+  return fat_file_seek(file, 0, (flags & FAT_APPEND) ? FAT_SEEK_END : FAT_SEEK_START);
+}
+
+//------------------------------------------------------------------------------
+// Closes a file. Updates the directory entry if modified. Writes back the write 
+// buffer if dirty.
+
+int fat_file_close(File* file)
+{
+  if (!file->fat)
+    return FAT_ERR_PARAM;
+  return fat_file_sync(file);
+}
+
+//------------------------------------------------------------------------------
+int fat_file_read(File* file, void* buf, int len, int* bytes)
+{
+  *bytes = 0;
+  uint8_t* dst = buf;
+
+  if (!file->fat)
+    return FAT_ERR_PARAM;
+
+  if (0 == (file->flags & FAT_READ))
+    return FAT_ERR_DENIED;
+  
+  file->flags |= FAT_ACCESSED;
+
+  while (len && file->offset < file->size)
+  {
+    int idx = file->offset % 512;
+    int cnt = LIMIT(len, LIMIT(512 - idx, file->size - file->offset));
+    memcpy(dst, file->buf + idx, cnt);
+
+    *bytes += cnt;
+    dst += cnt;
+    len -= cnt;
+
+    int err = fat_file_seek(file, cnt, FAT_SEEK_CURR);
+    if (err)
+      return err;
+  }
+
   return FAT_ERR_NONE;
 }
 
 //------------------------------------------------------------------------------
-int fat_fread(file_t* file, void* buf, int len)
+// Write a number of bytes to the file. It allocates more clusters if the write
+// exceeds the allocated space. It return the error code and the number of bytes
+// written.
+
+int fat_file_write(File* file, const void* buf, int len, int* bytes)
 {
-  int err;
-  int bytes = 0;
-  uint8_t* dst = buf;
-  dir_t* dir = &file->dir;
-  fat_t* fat = dir->fat;
-
-  if (fat == NULL)
-    return FAT_ERR_PARAM;
-
-  if (!file->read)
-    return FAT_ERR_DENIED;
-  
-  file->accessed = true;
-  
-  while (len && file->size > file->off)
-  {
-    err = move_buf(fat, file, file->sect);
-    if (err)
-      break;
-    
-    int idx = file->off % SECT_SIZE;
-    int cnt = LIMIT(len, LIMIT(SECT_SIZE - idx, file->size - file->off));
-    memcpy(dst, file->buf + idx, cnt);
-
-    bytes += cnt;
-    dst += cnt;
-    len -= cnt;
-
-    err = fat_fseek(file, cnt, FAT_SEEK_CURR);
-    if (err)
-      break;
-  }
-
-  return err < 0 ? err : bytes;
-}
-
-//------------------------------------------------------------------------------
-int fat_fwrite(file_t* file, const void* buf, int len)
-{
-  int err;
-  int bytes = 0;
+  int err = FAT_ERR_NONE;
   const uint8_t* src = buf;
-  dir_t* dir = &file->dir;
-  fat_t* fat = dir->fat;
+  *bytes = 0;
 
-  if (fat == NULL)
+  if (!file->fat)
     return FAT_ERR_PARAM;
 
-  if (!file->write)
+  if (0 == (file->flags & FAT_WRITE))
     return FAT_ERR_DENIED;
   
-  file->modified = true;
-  file->accessed = true;
+  file->flags |= FAT_MODIFIED | FAT_ACCESSED;
 
   while (len)
   {
-    err = move_buf(fat, file, file->sect);
-    if (err)
-      break;
-    
-    int idx = file->off % SECT_SIZE;
-    int cnt = LIMIT(len, SECT_SIZE - idx);
+    int idx = file->offset % 512;
+    int cnt = LIMIT(len, 512 - idx);
     memcpy(file->buf + idx, src, cnt);
-    file->buf_dirty = true;
+    file->flags |= FAT_FILE_DIRTY;
 
-    bytes += cnt;
+    *bytes += cnt;
     src += cnt;
     len -= cnt;
 
-    err = fat_fseek(file, cnt, FAT_SEEK_CURR);
+    int err = fat_file_seek(file, cnt, FAT_SEEK_CURR);
     if (err)
       break;
   }
 
-  if (file->off > file->size)
-    file->size = file->off;
+  if (file->offset > file->size)
+    file->size = file->offset;
 
-  return err < 0 ? err : bytes;
+  return err;
 }
 
 //------------------------------------------------------------------------------
-int fat_fprintf(file_t* file, const char* fmt, ...)
+// Seek into the file. This is internally used to update the file buffer and extend
+// the file when needed. For a user, this is used to ether:
+//
+//  - Update the offset of subsequent reads and writes
+//  - Preallocate space in the file (just seek the number of bytes to allocate)
+// 
+// Seeking backwards take more time as the cluster chain (often) must be followed 
+// from the beginning.
+
+int fat_file_seek(File* file, int offset, int seek)
 {
-  static char buf[4096];
+  uint32_t ssect = file->sect;
+  int64_t off64 = 0;
 
-  va_list va;
-  va_start(va, fmt);
-  int len = fmt_va(buf, sizeof(buf), fmt, va);
-  va_end(va);
-
-  return fat_fwrite(file, buf, len);
-}
-
-//------------------------------------------------------------------------------
-int fat_fseek(file_t* file, int offset, int seek)
-{
-  int err;
-  int64_t s_off = 0;
-  dir_t* dir = &file->dir;
-  fat_t* fat = dir->fat;
-
-  if (fat == NULL)
+  if (!file->fat)
     return FAT_ERR_PARAM;
 
   switch (seek)
   {
-    case FAT_SEEK_SET:
-      s_off = 0;
+    case FAT_SEEK_START:
+      off64 = 0;
       break;
     case FAT_SEEK_CURR:
-      s_off = file->off;
+      off64 = file->offset;
       break;
     case FAT_SEEK_END:
-      s_off = file->size;
+      off64 = file->size;
       break;
   }
 
-  s_off += offset;
-  if (s_off < 0 || s_off > 0xffffffff)
+  off64 += offset;
+  if (off64 < 0 || off64 > 0xffffffff)
     return FAT_ERR_EOF;
 
-  uint32_t off = (uint32_t)s_off;
-  uint32_t dst_clust = off / (SECT_SIZE * fat->sect_per_clust);
-  uint32_t src_clust = file->off / (SECT_SIZE * fat->sect_per_clust);
+  uint32_t off = (uint32_t)off64;
+  uint32_t clust_size = 512 << file->fat->clust_shift;
+  uint32_t dst_clust = off / clust_size;
+  uint32_t src_clust = file->offset / clust_size;
 
   if (dst_clust < src_clust)
   {
     // Backtracking not possible. Start scan from the beginning.
-    file->clust = file->first_clust;
-    file->sect = clust_to_sect(fat, file->first_clust);
-    file->off = 0;
+    file->clust = file->sclust;
+    file->sect = clust_to_sect(file->fat, file->sclust);
+    file->offset = 0;
     src_clust = 0;
   }
 
+  // Follow the cluster chain. Expand when EOF.
   for (int i = 0; i < dst_clust - src_clust; i++)
   {
     uint32_t next;
-    err = get_fat(fat, file->clust, &next);
+    uint8_t flags;
+    int err = get_fat(file->fat, file->clust, &next, &flags);
     if (err)
       return err;
 
-    int status = get_clust_status(fat, next);
-
-    if (status & (CLUST_BAD | CLUST_FREE))
+    if (flags & (CLUST_BAD | CLUST_FREE))
       return FAT_ERR_BROKEN;
 
-    if (status & CLUST_LAST)
+    if (flags & CLUST_LAST)
     {
-      err = clust_chain_stretch(fat, file->clust, &next);
+      err = stretch_chain(file->fat, file->clust, &next);
       if (err)
         return err;
     }
@@ -1583,273 +1470,245 @@ int fat_fseek(file_t* file, int offset, int seek)
     file->clust = next;
   }
 
-  file->sect = clust_to_sect(fat, file->clust) + ((off / SECT_SIZE) % fat->sect_per_clust);
-  file->off = off;
+  file->sect = clust_to_sect(file->fat, file->clust) + ((off / 512) & file->fat->clust_msk);
+  file->offset = off;
+
+  // Update file buffer when moving to new sector
+  if (file->sect != ssect)
+  {
+    if (file->flags & FAT_FILE_DIRTY)
+    {
+      if (!file->fat->ops.write(file->buf, ssect))
+        return FAT_ERR_IO;
+      file->flags &= ~FAT_FILE_DIRTY;
+    }
+
+    if (!file->fat->ops.read(file->buf, file->sect))
+      return FAT_ERR_IO;
+  }
   
   return FAT_ERR_NONE;
 }
 
 //------------------------------------------------------------------------------
-int fat_ftell(file_t* file)
-{
-  return file->off;
-}
+// Synchronizes a file. Writes back dirty file data. Updates directory timestamp
+// when accessed. Update directory size and timestamp when modified.
 
-//------------------------------------------------------------------------------
-int fat_fsize(file_t* file)
-{
-  return file->size;
-}
-
-//------------------------------------------------------------------------------
-int fat_fsync(file_t* file)
+int fat_file_sync(File* file)
 {
   int err;
-  fat_t* fat = file->dir.fat;
-
-  if (fat == NULL)
+  if (!file->fat)
     return FAT_ERR_PARAM;
+  
+  if (!file->fat->ops.write(file->buf, file->sect))
+    return FAT_ERR_IO;
 
-  if (file->accessed || file->modified)
+  if (file->flags & (FAT_ACCESSED | FAT_MODIFIED))
   {
-    err = move_win(fat, file->dir.sect);
+    err = update_buf(file->fat, file->dir_sect);
     if (err)
       return err;
     
-    dir_ent_t* ent = (dir_ent_t*)(fat->win + file->dir.idx);
-    fat->win_dirty = true;
+    Sfn* sfn = (Sfn*)(file->fat->buf + file->dir_idx);
+    file->fat->flags |= FAT_BUF_DIRTY;
 
     uint16_t date, time;
-    put_timestamp(&date, &time);
+    encode_timestamp(&date, &time);
     
-    if (file->accessed)
-      ent->access_date = date;
+    if (file->flags & FAT_ACCESSED)
+      sfn->acc_date = date;
 
-    if (file->modified)
+    if (file->flags & FAT_MODIFIED)
     {
-      ent->size = file->size;
-      ent->modify_date = date;
-      ent->modify_time = time;
+      sfn->attr |= FAT_ATTR_ARCHIVE;
+      sfn->size = file->size;
+      sfn->mod_date = date;
+      sfn->mod_time = time;
     }
   }
 
-  err = sync_buf(fat, file);
-  if (err)
-    return err;
-  
-  err = sync_fat(fat);
+  err = sync_fs(file->fat);
   if (err)
     return err;
 
-  file->accessed = false;
-  file->modified = false;
-  
+  file->flags &= ~(FAT_ACCESSED | FAT_MODIFIED);
   return FAT_ERR_NONE;
 }
 
 //------------------------------------------------------------------------------
-int fat_unlink(const char* path)
+// Creates and enter a directory. Don't know if there is any point in returning dir.
+
+int fat_dir_create(Dir* dir, const char* path)
 {
-  dir_t dir;
-  int err = follow_path(&dir, &path);
-  if (err)
-    return err;
-  
-  int len = subpath_len(path);
-  if (len == 0 || path[len])
-    return FAT_ERR_PATH;
-
-  fat_t* fat = dir.fat;
-  dir_t sdir = dir;
-
-  err = dir_search(fat, &dir, path, len, &sdir);
-  if (err)
-    return err;
-  
-  dir_ent_t* ent = (dir_ent_t*)(fat->win + dir.idx);
-
-  err = clust_chain_remove(fat, ent->clust_hi << 16 | ent->clust_lo);
-  if (err)
-    return err;
-
-  for (;;)
-  {
-    err = move_win(fat, sdir.sect);
-    if (err)
-      return err;
-
-    dir_ent_t* ent = (dir_ent_t*)(fat->win + sdir.idx);
-    ent->name[0] = SFN_FREE;
-    fat->win_dirty = true;
-
-    if (sdir.sect == dir.sect && sdir.idx == dir.idx)
-      break;
-    
-    err = dir_next(fat, &sdir);
-    if (err)
-      return err;
-  }
-
-  return sync_fat(fat);
-}
-
-//------------------------------------------------------------------------------
-int fat_mkdir(const char* path)
-{
-  dir_t dir;
-  int err = follow_path(&dir, &path);
+  int err = follow_path(dir, &path, NULL);
   if (err != FAT_ERR_EOF)
     return err;
   
-  fat_t* fat = dir.fat;
-
-  int len = subpath_len(path);
-  if (len == 0 || path[len])
+  int len = last_subpath_len(path);
+  if (len == 0)
     return FAT_ERR_PATH;
 
-  uint32_t prev = dir.first_clust;
-  if (prev == 2) // Old cluster is the root directory
-    prev = 0;
-
   // Create a new directory
-  uint32_t new;
-  err = clust_chain_create(fat, &new);
+  uint32_t clust;
+  err = create_chain(dir->fat, &clust);
   if (err)
     return err;
 
-  err = clust_clear(fat, new);
+  // Empty directory
+  err = clust_clear(dir->fat, clust);
   if (err)
     return err;
 
   uint16_t date, time;
-  put_timestamp(&date, &time);
+  encode_timestamp(&date, &time);
 
-  err = move_win(fat, clust_to_sect(fat, new));
+  err = update_buf(dir->fat, clust_to_sect(dir->fat, clust));
+  if (err)
+    return err;
+
+  Sfn* sfn = (Sfn*)dir->fat->buf;
+  dir->fat->flags |= FAT_BUF_DIRTY;
+
+  memset(sfn[0].name, ' ', sizeof(sfn->name));
+  sfn[0].name[0] = '.';
+  sfn[0].attr = FAT_ATTR_DIR;
+  sfn[0].clust_hi = clust >> 16;
+  sfn[0].clust_lo = clust & 0xffff;
+  sfn[0].cre_date = date;
+  sfn[0].cre_time = time;
+  sfn[0].mod_date = date;
+  sfn[0].mod_time = time;
+  sfn[0].acc_date = date;
+
+  uint32_t parent = dir->sclust;
+  if (parent == dir->fat->root_clust)
+    parent = 0;
+  
+  memcpy(sfn + 1, sfn, sizeof(Sfn));
+  sfn[1].name[1] = '.';
+  sfn[1].clust_hi = parent >> 16;
+  sfn[1].clust_lo = parent & 0xffff;
+
+  err = dir_add(dir, path, len, FAT_ATTR_DIR, clust);
   if (err)
     return err;
   
-  dir_ent_t* ent = (dir_ent_t*)fat->win;
-  fat->win_dirty = true;
+  dir_enter(dir, clust);
+  return sync_fs(dir->fat);
+}
 
-  memset(ent->name, ' ', sizeof(ent->name));
-  ent->name[0] = '.';
-  ent->attr = FAT_ATTR_DIR;
-  ent->clust_hi = new >> 16;
-  ent->clust_lo = new & 0xffff;
-  ent->create_date = date;
-  ent->create_time = time;
-  ent->modify_date = date;
-  ent->modify_time = time;
-  ent->access_date = date;
-
-  memcpy(ent + 1, ent, sizeof(dir_ent_t));
-  ent[1].name[1] = '.';
-  ent[1].clust_hi = prev >> 16;
-  ent[1].clust_lo = prev & 0xffff;
-
-  err = dir_register(fat, &dir, path, len, FAT_ATTR_DIR, new);
+//------------------------------------------------------------------------------
+int fat_dir_open(Dir* dir, const char* path)
+{
+  int err = follow_path(dir, &path, NULL);
   if (err)
     return err;
   
-  return sync_fat(fat);
-}
+  if (dir_at_root(dir))
+    return FAT_ERR_NONE;
 
-//------------------------------------------------------------------------------
-int fat_opendir(dir_t* dir, const char* path)
-{
-  int err = follow_path(dir, &path);
+  // Dir points to the directory SFN. Enter the directory.
+  err = update_buf(dir->fat, dir->sect);
   if (err)
     return err;
 
-  return subpath_len(path) ? FAT_ERR_PATH : FAT_ERR_NONE;
+  Sfn* sfn = dir_ptr(dir);
+  if (0 == (sfn->attr & FAT_ATTR_DIR))
+    return FAT_ERR_PATH;
+
+  dir_enter(dir, sfn_cluster(sfn));
+  return FAT_ERR_NONE;
 }
 
 //------------------------------------------------------------------------------
-int fat_readdir(dir_t* dir, dir_info_t* info)
+// Read directory entry pointed to by dir. Use dir_next to advance directory pointer.
+
+int fat_dir_read(Dir* dir, DirInfo* info)
 {
-  fat_t* fat = dir->fat;
-  if (!fat)
+  if (!dir->fat)
     return FAT_ERR_PARAM;
-  
-  for (;;)
+
+  for (int err = 0;; err = dir_next(dir)) // Hack to allow continue
   {
-    int err = move_win(fat, dir->sect);
     if (err)
       return err;
-    
-    dir_ent_t* ent = (dir_ent_t*)(fat->win + dir->idx);
 
-    if (dir_ent_is_last(ent))
+    err = update_buf(dir->fat, dir->sect);
+    if (err)
+      return err;
+
+    Sfn* sfn = dir_ptr(dir);
+
+    if (sfn_is_last(sfn))
       return FAT_ERR_EOF;
 
-    if (!dir_ent_is_free(ent))
+    if (sfn_is_free(sfn))
+      continue;
+
+    if (sfn_is_lfn(sfn))
     {
-      if (dir_ent_is_lfn(ent))
-      {
-        err = load_lfn_name(fat, dir);
-        if (err)
-          return err;
+      err = parse_lfn_name(dir);
+      if (err)
+        return err;
 
-        err = move_win(fat, dir->sect);
-        if (err)
-          return err;
-        
-        // Following entry must be SFN
-        ent = (dir_ent_t*)(fat->win + dir->idx);
-        
-        if (dir_ent_is_free(ent))
-          return FAT_ERR_BROKEN;
-
-        if (fat->crc != calc_crc(ent->name))
-          return FAT_ERR_BROKEN;
-      }
-      else
-        load_sfn_name(fat, ent);
-
-      memcpy(info->name, fat->name, fat->namelen);
-      info->namelen = fat->namelen;
-
-      get_timestamp(ent->create_date, ent->create_time, &info->created);
-      get_timestamp(ent->modify_date, ent->modify_time, &info->modified);
-
-      info->size = ent->size;
-      info->attr = ent->attr;
-
-      return FAT_ERR_NONE;
+      // Following entry must be SFN
+      err = update_buf(dir->fat, dir->sect);
+      if (err)
+        return err;
+      
+      sfn = dir_ptr(dir);
+      if (sfn_is_free(sfn) || g_crc != get_crc(sfn->name))
+        return FAT_ERR_BROKEN;
     }
+    else
+      parse_sfn_name(sfn->name);
 
-    err = dir_next(fat, dir);
-    if (err)
-      return err;
+    // Parsed filename (SFN or LFN) are in global buffer
+    memcpy(info->name, g_buf, g_len);
+    info->name_len = g_len;
+
+    decode_timestamp(sfn->cre_date, sfn->cre_time, &info->created);
+    decode_timestamp(sfn->mod_date, sfn->mod_time, &info->modified);
+
+    info->size = sfn->size;
+    info->attr = sfn->attr;
+
+    return FAT_ERR_NONE;
   }
 }
 
 //------------------------------------------------------------------------------
-int fat_nextdir(dir_t* dir)
+// Advances the directory pointer. Returns EOF when the EOF marker is hit. The 
+// user should not call this after that point. Call rewind to reset the directory
+// pointer to the beginning.
+
+int fat_dir_next(Dir* dir)
 {
-  return dir_next(dir->fat, dir);
+  if (!dir->fat)
+    return FAT_ERR_PARAM;
+
+  return dir_next(dir);
 }
 
 //------------------------------------------------------------------------------
-__attribute__((weak)) void fat_get_timestamp(timestamp_t* dt)
+// Sets dir to point to the first entry in the directory.
+int fat_dir_rewind(Dir* dir)
 {
-  dt->day   = 1;
-  dt->month = 1;
-  dt->year  = 1980;
-  dt->hour  = 0;
-  dt->min   = 0;
-  dt->sec   = 0;
+  if (!dir->fat)
+    return FAT_ERR_PARAM;
+  dir_at_clust(dir, dir->sclust);
+  return FAT_ERR_NONE;
 }
 
 //------------------------------------------------------------------------------
 const char* fat_get_error(int err)
 {
-  static const char* codes[] =
+  static const char* strs[] =
   {
     "FAT_ERR_NONE",
     "FAT_ERR_NOFAT",
     "FAT_ERR_BROKEN",
-    "FAT_ERR_DISK",
+    "FAT_ERR_IO",
     "FAT_ERR_PARAM",
     "FAT_ERR_PATH",
     "FAT_ERR_EOF",
@@ -1858,5 +1717,20 @@ const char* fat_get_error(int err)
   };
 
   err = -err;
-  return err >= 0 && err < sizeof(codes) / sizeof(char*) ? codes[err] : "FAT_ERR_UNKNOWN";
+  if (err < 0 || err >= sizeof(strs) / sizeof(*strs))
+    return "NULL";
+  return strs[err];
+}
+
+//------------------------------------------------------------------------------
+// Override this function if it is needed. It is declared weak.
+
+__attribute__((weak)) void fat_get_timestamp(Timestamp* ts)
+{
+  ts->day   = 1;
+  ts->month = 1;
+  ts->year  = 1980;
+  ts->hour  = 0;
+  ts->min   = 0;
+  ts->sec   = 0;
 }
