@@ -39,26 +39,6 @@ enum
   CLUST_BAD  = 0x08,
 };
 
-enum
-{
-  FMT_ZERO        = 0x1,
-  FMT_NO_SIGN     = 0x2,
-  FMT_SIGN        = 0x4,
-  FMT_LEFT        = 0x8,
-  FMT_UPPER       = 0x10,
-  FMT_HEX         = 0x20,
-  FMT_BIN         = 0x40,
-  FMT_CHAR        = 0x80,
-  FMT_STR         = 0x100,
-  FMT_SHORT       = 0x200,
-  FMT_SHORT_SHORT = 0x400,
-  FMT_LONG        = 0x800,
-  FMT_LONG_LONG   = 0x1000,
-  FMT_NUM         = 0x2000,
-  FMT_UNSIGNED    = 0x4000,
-  FMT_FLOAT       = 0x8000,
-};
-
 //------------------------------------------------------------------------------
 typedef struct __attribute__((packed))
 {
